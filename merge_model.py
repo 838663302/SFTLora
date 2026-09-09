@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 import config
