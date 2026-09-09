@@ -35,15 +35,12 @@ def infer(
         {"role": "user", "content": prompt},
     ]
 
-    chat_kwargs = {
-        "messages": messages,
-        "tokenize": False,
-        "add_generation_prompt": True,
-    }
-    if tools:
-        chat_kwargs["tools"] = tools
-
-    text = tokenizer.apply_chat_template(**chat_kwargs)
+    text = tokenizer.apply_chat_template(
+        conversation=messages,
+        tools=tools,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
 
     with torch.no_grad():
