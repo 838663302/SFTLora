@@ -81,7 +81,7 @@ def main():
         }
     ]
 
-    prompt = "告诉我 CMP 工作区下 CPT-HC 项目的 d环境的登陆code和mta文件是什么"
+    prompt = "帮我登录到CMP 工作区下 CPT-HC 项目的 d环境，然后告诉我mta文件是什么"
     print(f"User Query: {prompt}\n")
 
     think, response = infer(prompt, tools=tools)
