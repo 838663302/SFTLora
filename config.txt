@@ -1,0 +1,19 @@
+工作区间CMP：
+-CPT项目开发环境登陆code是162-d-cpt，部署mta文件是mta-quality.yaml
+-PT项目开发环境登录code是162-d-pt；mta文件是mta-prequality-pt.yaml
+-HC项目开发环境登录code是162-d-hc；mta文件是mta-prequality-hc.yaml
+-HCS1T项目的开发环境的登陆code是162-d-hc，部署mta文件是mta-prequality-hc-s1t.yaml
+-CPT-PT项目的开发环境的登陆code是162-d-pt，部署mta文件是mta-prequality-cpt-pt.yaml
+-CPT-PT项目的quality环境的登陆code是162-q-pt，部署mta文件是mta-quality-cpt-pt.yaml
+
+-CPT-HC项目的开发环境的登陆code是162-d-hc，部署mta文件是mta-prequality-cpt-hc.yaml
+-CPT-HC项目的quality环境的登陆code是162-q-hc，部署mta文件是mta-quality-cpt-hc.yaml
+
+-CPT项目quality环境登陆code是162-q-cpt，部署mta文件是mta-quality.yaml
+-PT项目的quality环境登陆code是162-q-pt，部署mta文件是mta-quality-pt.yaml
+-HC项目的quality环境的登陆code是162-q-hc，部署mta文件是mta-quality-hc.yaml
+
+工作区间MPB：
+-HC开发环境登陆code是163-d-hc, mta文件是mta-develop-hc.yaml
+-CPT项目开发环境登录code是162-d-cpt, mta文件是mta-develop.yaml
+-PT项目开发环境登录code是162-d-pt；mta文件是mta-develop-pt.yaml
