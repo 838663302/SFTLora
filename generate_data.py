@@ -1,5 +1,6 @@
-﻿import json
+import json
 import random
+import uuid
 from pathlib import Path
 
 # 1. 来自 config.txt 的 14 条明确业务规则
@@ -113,6 +114,24 @@ COMMAND_TOOL_VARIANTS = [
                 }
             }
         }
+    },
+    {
+        "name": "powershell",
+        "param": "command",
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "powershell",
+                "description": "Execute a PowerShell command or script",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "PowerShell command to execute"}
+                    },
+                    "required": ["command"]
+                }
+            }
+        }
     }
 ]
 
@@ -198,8 +217,8 @@ def get_random_tools():
     return cmd_tool["name"], cmd_tool["param"], tools_list
 
 
-def build_action_samples():
-    """生成需要执行 Tool Call 的行动样本"""
+def build_multiturn_action_samples():
+    """生成原生多轮 Agent 工具交互样本（包含工具调用与结果回传后的自主总结）"""
     samples = []
     for rule in RULES:
         ws = rule["workspace"]
@@ -207,16 +226,103 @@ def build_action_samples():
         code = rule["code"]
         mta = rule["mta"]
         env_names = ENV_SYNONYMS[rule["env"]]
+        env_disp = "开发环境" if rule["env"] == "dev" else "quality环境"
 
         for tmpl in ACTION_TEMPLATES:
             env_str = random.choice(env_names)
             user_text = tmpl.format(ws=ws, proj=proj, env=env_str)
             tool_name, param_name, tools_list = get_random_tools()
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
 
             curl_cmd = f"curl -X POST http://localhost:3000/space/login -H \"Content-Type: application/json\" -d '{{\"space\": \"{code}\"}}'"
             tool_args = {param_name: curl_cmd}
 
-            sample = {
+            # 1. 成功回传分支 (Success Multi-turn)
+            tool_res_success = random.choice([
+                json.dumps({"status": "success", "code": 200, "message": f"Successfully logged into space {code}"}, ensure_ascii=False),
+                json.dumps({"success": True, "space": code, "output": "Login successful"}, ensure_ascii=False),
+                f"HTTP/1.1 200 OK\nContent-Type: application/json\n\n{{\"status\": 200, \"space\": \"{code}\"}}"
+            ])
+
+            assistant_final_success = random.choice([
+                f"✅ 登录接口已成功调用！\n- **工作区**：{ws}\n- **项目**：{proj}（{env_disp}）\n- **登录 code**：`{code}`\n- **部署 MTA 文件**：`{mta}`\n开发环境已就绪，可以开始后续开发部署。",
+                f"已成功为您完成登录操作：\n1. **项目与环境**：{ws} 工作区 / {proj} 项目（{env_disp}）\n2. **登录 code**：`{code}`\n3. **MTA 配置文件**：`{mta}`\n接口调用状态正常，环境已准备就绪。",
+                f"登录操作完成！\n- 登录 code: `{code}`\n- MTA 部署文件: `{mta}`\n本地 API 返回登录成功。"
+            ])
+
+            multi_turn_sample = {
+                "tools": tools_list,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": json.dumps(tool_args, ensure_ascii=False)
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "role": "tool",
+                        "name": tool_name,
+                        "tool_call_id": call_id,
+                        "content": tool_res_success
+                    },
+                    {
+                        "role": "assistant",
+                        "content": assistant_final_success
+                    }
+                ]
+            }
+            samples.append(multi_turn_sample)
+
+            # 2. 失败异常回传分支 (Error Multi-turn) - 少量样本提升健壮性
+            if random.random() < 0.2:
+                tool_res_error = json.dumps({"status": 500, "error": "Connection refused to http://localhost:3000/space/login"}, ensure_ascii=False)
+                assistant_final_error = f"❌ 调用登录接口失败（连接本地 3000 端口被拒绝）。\n- 目标登录 code：`{code}`\n- 部署 MTA 文件：`{mta}`\n请检查本地登录服务是否正常启动后重试。"
+
+                error_sample = {
+                    "tools": tools_list,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_text},
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": json.dumps(tool_args, ensure_ascii=False)
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "role": "tool",
+                            "name": tool_name,
+                            "tool_call_id": call_id,
+                            "content": tool_res_error
+                        },
+                        {
+                            "role": "assistant",
+                            "content": assistant_final_error
+                        }
+                    ]
+                }
+                samples.append(error_sample)
+
+            # 3. 单轮直接 Action 分支 (Single-turn Action) - 兼容单轮客户端
+            single_turn_sample = {
                 "tools": tools_list,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -226,6 +332,7 @@ def build_action_samples():
                         "content": f"登录 code: {code}\nMTA 文件: {mta}",
                         "tool_calls": [
                             {
+                                "id": call_id,
                                 "type": "function",
                                 "function": {
                                     "name": tool_name,
@@ -236,7 +343,8 @@ def build_action_samples():
                     }
                 ]
             }
-            samples.append(sample)
+            samples.append(single_turn_sample)
+
     return samples
 
 
@@ -394,15 +502,17 @@ def build_qa_samples():
 def generate_dataset():
     random.seed(42)
 
-    action_samples = build_action_samples()  # 182 条
-    qa_samples = build_qa_samples()          # 约 160 条
+    action_samples = build_multiturn_action_samples()
+    qa_samples = build_qa_samples()
 
-    # 抽取约 150 条 Action 和 100 条 QA，组合成高质量数据集 (约 250 条)
+    print(f"原始生成: Action 样本 {len(action_samples)} 条, QA 样本 {len(qa_samples)} 条")
+
     random.shuffle(action_samples)
     random.shuffle(qa_samples)
 
-    selected_actions = action_samples[:160]
-    selected_qa = qa_samples[:100]
+    # 抽取高质量混合数据 (约 350 条样本)
+    selected_actions = action_samples[:220]
+    selected_qa = qa_samples[:130]
 
     all_samples = selected_actions + selected_qa
     random.shuffle(all_samples)
@@ -427,10 +537,10 @@ def generate_dataset():
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
     print("=" * 60)
-    print("知识库与通用 Tool Call 复合数据集生成完成！")
+    print("原生 Multi-Turn Agent 复合数据集生成完成！")
     print(f"总生成样本数: {len(all_samples)} 条")
-    print(f"  - 行动类样本 (Tool Call 登录): {len(selected_actions)} 条")
-    print(f"  - 知识库问答类样本 (纯 QA 查询): {len(selected_qa)} 条")
+    print(f"  - Action 多轮与行动样本: {len(selected_actions)} 条")
+    print(f"  - 知识库问答 QA 样本: {len(selected_qa)} 条")
     print(f"划分结果:")
     print(f"  - 训练集 (train.jsonl): {len(train_data)} 条 -> {train_file}")
     print(f"  - 验证集 (val.jsonl): {len(val_data)} 条 -> {val_file}")
@@ -438,3 +548,4 @@ def generate_dataset():
 
 if __name__ == "__main__":
     generate_dataset()
+
