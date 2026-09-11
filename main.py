@@ -2,7 +2,8 @@ import inspect
 import os
 from typing import Any
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+if "LOCAL_RANK" not in os.environ:
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import torch
 import transformers
@@ -83,8 +84,8 @@ def make_sft_config():
         per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
         gradient_accumulation_steps=2,
-        learning_rate=2e-4,
-        fp16=True,
+        learning_rate=3e-4,          # 2e-4 -> 3e-4：全局 batch 4 -> 8 的补偿
+        fp16=True,                   # T4(Turing) 不支持 bf16，继续用 fp16 + GradScaler
         lr_scheduler_type="cosine",
         warmup_steps=10,
         max_grad_norm=1.0,
@@ -96,18 +97,25 @@ def make_sft_config():
         save_steps=20,
         save_total_limit=2,
         load_best_model_at_end=True,
+        report_to="none",            # 不接 wandb，避免多进程重复上报
         **extra_kwargs,
     )
 
 
 def main():
+    # 只在主进程做长度自检与日志打印，否则两个 rank 会把 809 条样本各 tokenize 一遍
+    is_main_process = int(os.environ.get("LOCAL_RANK", 0)) == 0
+
     data_dict = process()
     model_name = "Qwen/Qwen3-1.7B"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    print(f"训练集 {len(data_dict['train'])} 条 / 验证集 {len(data_dict['val'])} 条")
-    check_max_length(data_dict["train"], tokenizer, MAX_LENGTH)
+    if is_main_process:
+        print(f"[并行] world_size={os.environ.get('WORLD_SIZE', 1)} "
+              f"可见 GPU 数={torch.cuda.device_count()}")
+        print(f"训练集 {len(data_dict['train'])} 条 / 验证集 {len(data_dict['val'])} 条")
+        check_max_length(data_dict["train"], tokenizer, MAX_LENGTH)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -146,7 +154,8 @@ def main():
 
     trainer.save_model(str(config.MODEL_PATH))
     tokenizer.save_pretrained(str(config.MODEL_PATH))
-    print(f"LoRA 权重与 Tokenizer 已保存至: {config.MODEL_PATH}")
+    if is_main_process:
+        print(f"LoRA 权重与 Tokenizer 已保存至: {config.MODEL_PATH}")
 
 
 if __name__ == "__main__":

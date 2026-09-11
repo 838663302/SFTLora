@@ -347,6 +347,65 @@ def make_tools_list(profile):
     return json.loads(json.dumps(profile["tools"], ensure_ascii=False))
 
 
+def make_call(content, tool, args):
+    """构造一条「assistant + tool_call」消息。
+
+    tool 可以是菜单里的任意工具——既能表达 shell 工具（execute_command / Bash / ...），
+    也能表达 CodeBuddy 的文件工具（search_file / read_file / write_to_file）。
+    """
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [{
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {"name": tool, "arguments": json.dumps(args, ensure_ascii=False)},
+        }],
+    }
+
+
+def make_result(call_message, content, tool=None):
+    """配对一条 tool 结果消息；name 默认取对应调用里的工具名。"""
+    return {
+        "role": "tool",
+        "name": tool or call_message["tool_calls"][0]["function"]["name"],
+        "tool_call_id": call_message["tool_calls"][0]["id"],
+        "content": content,
+    }
+
+
+def make_mta_content(project):
+    """构造一段真实感的 mta.yaml 内容，用于演示「读取源文件内容 -> 写入根目录 mta.yaml」。"""
+    return (
+        "_schema-version: '3.1'\n"
+        f"ID: {project.lower()}\n"
+        "version: 1.0.0\n"
+        "parameters:\n"
+        "  enable-parallel-deployments: true\n"
+        "modules:\n"
+        f"  - name: {project.lower()}-srv\n"
+        "    type: nodejs\n"
+        "    path: gen/srv\n"
+    )
+
+
+def locate_mta(rule):
+    """返回 (匹配到的源文件相对路径, 该工作区下的全部 mta 候选文件)。
+
+    真实项目里 mta-*.yaml 有时放在项目根目录，有时放在 mta/ 子目录，
+    所以训练目标是「先查找候选 -> 定位匹配文件 -> 读取内容 -> 写入 mta.yaml」，
+    而不是盲写一个根目录下的文件名（后者正是线上 agent「找不到 mta 文件」的根因）。
+    """
+    ws_mtas = sorted({r["mta"] for r in RULES if r["workspace"] == rule["workspace"]})
+    mta_dir = rng.choice(["", "mta/"])
+    mta_src = f"{mta_dir}{rule['mta']}"
+    candidates = [f"{mta_dir}{m}" for m in ws_mtas]
+    if mta_src not in candidates:
+        candidates.append(mta_src)
+    rng.shuffle(candidates)
+    return mta_src, candidates
+
+
 # ============================================================
 # 3. 环境同义词（中英混合）
 # ============================================================
@@ -429,11 +488,12 @@ DEPLOY_AGENT_INSTRUCTION = (
     "请根据以下步骤帮我完成 SAP BTP 项目的构建与部署，注意：不要对项目的源代码做任何检查、审查或分析，"
     "也不要尝试理解或修改代码内容，严格按照下面的步骤直接执行部署操作即可。\n\n"
     "首先根据目标环境匹配对应的登录 code，调用本地登录接口完成 BTP 空间登录。\n\n"
-    "接着根据部署环境，找到对应的mta文件，找到匹配的 YAML 文件后，将其完整内容复制到根目录下的 mta.yaml 文件中。\n\n"
+    "接着根据部署环境，找到对应的mta文件，找到匹配的 YAML 文件后，"
+    "将其完整内容复制到根目录下的 mta.yaml 文件中，如果根目录没有mta.yaml文件就新建一个。\n\n"
     "接着，在项目根目录执行 mbt build 命令进行项目打包，这个构建过程大约需要 2 分钟甚至更久，"
     "所以必须特别注意 timeout 设置，请将命令超时时间设置得足够长（建议至少 10 分钟 / 600 秒），"
     "使用非交互模式运行，绝对不要因为 timeout 而中途终止命令，必须等待命令完整返回退出码后再进行下一步。\n\n"
-    "构建完成后，获取构建日志的最后 20 行，从中匹配类似 the MTA archive generated at: 的行，"
+    "构建完成后，获取构建日志的最后 10 行，从中匹配类似 the MTA archive generated at: 的行，"
     "提取出 .mtar 文件的完整路径。\n\n"
     "接着，使用提取到的文件路径执行 cf deploy <构建文件路径> 命令进行部署，这个部署过程同样大约需要 2 分钟甚至更久，"
     "所以也必须特别注意 timeout 设置，请将命令超时时间设置得足够长（建议至少 10 分钟 / 600 秒），"
@@ -465,16 +525,70 @@ MTAR_VERSION_POOL = ["1.0.0", "1.2.0", "2.0.1", "0.9.7", "3.4.0"]
 MTAR_SUFFIX_POOL = ["", "", "", "-srv", "-app", "-db"]
 
 
-def make_mtar_path(project):
-    """随机生成一个真实感的归档路径。
-    故意加入版本号与后缀的变化，避免模型背下 `{proj}_1.0.0.mtar` 这条公式，
-    逼它真的去读构建日志里的 the MTA archive generated at: 那一行。"""
+def make_mtar_name(project):
+    """随机生成一个真实感的归档文件名（带后缀/版本号的变化，避免模型背公式）。"""
     base = project.lower()
-    return f"mta_archives/{base}{rng.choice(MTAR_SUFFIX_POOL)}_{rng.choice(MTAR_VERSION_POOL)}.mtar"
+    return f"{base}{rng.choice(MTAR_SUFFIX_POOL)}_{rng.choice(MTAR_VERSION_POOL)}.mtar"
+
+
+def make_mtar_path(project):
+    """相对项目根目录的归档路径（用于 devops 单步样本）。"""
+    return f"mta_archives\\{make_mtar_name(project)}"
+
+
+def make_chain_mtar(rule):
+    """返回 (构建日志里出现的路径, cf deploy 使用的完整路径, 项目根目录, 是否需要拼接)。
+
+    故意随机两种情况，逼模型真的去读日志的最后几行、并做路径补全，而不是背公式：
+      A. 日志打印的是相对路径 -> 需要拼接项目根目录补全为完整路径；
+      B. 日志已经是完整路径 -> 直接使用。
+    """
+    name = make_mtar_name(rule["project"])
+    rel = f"mta_archives\\{name}"
+    root = f"C:\\work\\{rule['workspace']}"
+    if rng.random() < 0.5:
+        return rel, f"{root}\\{rel}", root, True
+    full = f"{root}\\{rel}"
+    return full, full, root, False
+
+
+def make_build_log(archive_path):
+    """构造一段真实感的 `mbt build` 输出（20 行左右）。
+
+    归档行被埋在日志靠后的位置（落在「最后 10 行」之内），前面全是构建噪声，
+    这样模型必须真的去扫日志尾部，而不是读第一行或凭记忆编一个路径。
+    """
+    lines = [
+        "[10:12:01] INFO validating the MTA project",
+        "[10:12:02] INFO module ui: validating module content",
+        "[10:12:04] INFO module srv: validating module content",
+        "[10:12:05] INFO building the MTA project",
+        "[10:12:06] INFO building the module ui",
+        "[10:12:31] INFO module ui: running npm install",
+        "[10:13:18] INFO module ui: build succeeded",
+        "[10:13:19] INFO building the module srv",
+        "[10:13:44] INFO module srv: running npm install",
+        "[10:14:20] INFO module srv: build succeeded",
+        "[10:14:21] INFO assembling the MTA archive",
+        "[10:14:22] INFO reading the mta.yaml descriptor",
+        "[10:14:22] INFO resolving module dependencies",
+        "[10:14:24] INFO collecting the build artifacts",
+        "[10:14:25] INFO generating the MTA archive manifest",
+        "[10:14:26] INFO compressing the archive content",
+        "[10:14:28] INFO archive content compressed",
+        "[10:14:29] INFO writing the MTA archive",
+        f"[10:14:30] INFO the MTA archive generated at: {archive_path}",
+        "[10:14:30] INFO cleaning temporary files",
+        "[10:14:31] INFO build succeeded",
+    ]
+    return "\n".join(lines)
 
 
 STEP_ORDER = ["login", "copy", "build", "deploy", "clean"]
-FAILABLE_STEPS = ["login", "copy", "build", "deploy"]
+# 「复制 mta 文件」不再作为失败中止分支：真实项目里 mta-*.yaml 可能不在根目录，
+# 正确行为是「先查找、再复制/写入」，而不是找不到就整体中止。
+# 之前把 copy 放进失败分支，等于在教模型「文件没找到就停下来」，这正是线上报障的根因。
+FAILABLE_STEPS = ["login", "build", "deploy"]
 
 
 def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, fail_points, profile):
@@ -491,107 +605,134 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
 
     tools_list = make_tools_list(profile)
     tool_name = shell_tool_name(profile)
-    mtar_path = make_mtar_path(proj)
+    mtar_log, mtar_full, mta_root, need_join = make_chain_mtar(rule)
 
-    def make_pre(content, step_key, command, requires_approval, short_desc, is_long_running=False):
+    mta_src, mta_candidates = locate_mta(rule)
+    mta_content = make_mta_content(proj)
+
+    def shell_call(content, command, requires_approval, short_desc, is_long_running=False):
         args = build_arguments(profile, command, short_desc, requires_approval, is_long_running)
-        return {
-            "role": "assistant",
-            "content": content,
-            "tool_calls": [{
-                "id": f"call_{step_key}_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": tool_name,
-                    "arguments": json.dumps(args, ensure_ascii=False),
-                },
-            }],
-        }
+        return make_call(content, tool_name, args)
 
-    def make_tool_result(pre_message, content):
-        return {
-            "role": "tool",
-            "name": tool_name,
-            "tool_call_id": pre_message["tool_calls"][0]["id"],
-            "content": content,
-        }
-
-    # 每个 step 形如 (assistant_pre, 成功结果, 失败结果, 中文步骤名)
+    # 每个 step 形如 dict(key, pre, ok, fail, label)。
     # 中间轮措辞统一为「状态 + 下一步动作 + 冒号」，禁止完成态措辞，
     # 把「全部完成 / 已就绪」这类收尾语气全部留给 success summary。
     steps = [
-        (
-            make_pre(
+        {
+            "key": "login",
+            "pre": shell_call(
                 f"开始执行部署流程。先完成 {ws} 工作区 {proj} 项目（{env_str}）的空间登录，"
                 f"对应的登录 code 为 `{code}`：",
-                "login",
                 ("Invoke-RestMethod -Uri http://localhost:3000/space/login -Method Post "
                  f"-ContentType application/json -Body (@{{space='{code}'}}|ConvertTo-Json)"),
                 True,
                 "登录 BTP 空间",
             ),
-            json.dumps({"code": 200, "data": "success", "message": "success"}, ensure_ascii=False),
-            ("Invoke-RestMethod : The remote server returned an error: (401) Unauthorized.\r\n"
-             f"login failed for space '{code}'"),
-            "空间登录",
-        ),
-        (
-            make_pre(
-                f"空间 `{code}` 已登录。根据目标环境匹配到 MTA 配置文件 `{mta}`，"
-                f"接下来把它覆盖复制为根目录下的 `mta.yaml`：",
-                "copy", f"Copy-Item {mta} -Destination mta.yaml -Force", False,
-                "复制 MTA 配置为 mta.yaml",
-            ),
-            "",
-            f"Copy-Item : Cannot find path '{mta}' because it does not exist.",
-            "MTA 文件复制",
-        ),
-        (
-            make_pre(
-                "`mta.yaml` 已就绪。接下来在项目根目录执行 `mbt build` 打包构建"
-                "（超时 600 秒，非交互模式，需等待命令完整返回）：",
-                "build", "mbt build", False,
-                "构建 MTA 项目", True,
-            ),
-            ("[INFO] validating the MTA project\n"
-             "[INFO] building the MTA project\n"
-             f"[INFO] the MTA archive generated at: {mtar_path}\n"
-             "[INFO] cleaning temporary files"),
-            ("[INFO] validating the MTA project\n"
-             "[ERROR] the MTA project is not valid\n"
-             "[ERROR] build failed, no archive was generated"),
-            "项目构建（mbt build）",
-        ),
-        (
-            make_pre(
-                f"构建完成，从构建日志的最后 20 行中匹配到 `the MTA archive generated at:` 一行，"
-                f"提取出归档路径 `{mtar_path}`。接下来执行 `cf deploy` 部署"
-                "（超时 600 秒，非交互模式，需等待命令完整返回）：",
-                "deploy", f"cf deploy {mtar_path} -f", True,
-                "部署 MTAR 归档到 BTP", True,
-            ),
-            (f"Deploying multi-target app archive {mtar_path} in org my-org / space {code}...\r\n"
-             "Application started\r\n"
-             "Process finished."),
-            (f"Deploying multi-target app archive {mtar_path}...\r\n"
-             "[ERROR] Deployment failed: application did not start"),
-            "CF 部署（cf deploy）",
-        ),
-        (
-            make_pre(
-                "部署动作已返回成功。接下来执行清理，删除临时 `mta.yaml`、`mta_archives` 目录"
-                "以及 `.mta_build_tmp` 等构建产物：",
-                "clean",
-                ("Remove-Item -Path mta.yaml, mta_archives, .mta_build_tmp "
-                 "-Recurse -Force -ErrorAction SilentlyContinue"),
-                True,
-                "清理临时构建产物",
-            ),
-            "",
-            "",
-            "环境清理",
-        ),
+            "ok": json.dumps({"code": 200, "data": "success", "message": "success"}, ensure_ascii=False),
+            "fail": ("Invoke-RestMethod : The remote server returned an error: (401) Unauthorized.\r\n"
+                     f"login failed for space '{code}'"),
+            "label": "空间登录",
+        },
     ]
+
+    # ---- 「找到对应 mta 文件并复制内容为根目录 mta.yaml」按档位展开 ----
+    # CodeBuddy 档位带文件工具 -> 查找(search_file) / 读取(read_file) / 写入(write_to_file)；
+    # 只有 shell 的档位 -> 一条「递归查找 + 复制」命令。
+    if profile["id"] == "codebuddy":
+        steps.append({
+            "key": "copy",
+            "pre": make_call(
+                f"空间 `{code}` 已登录。接下来在项目中查找与 {env_disp} 匹配的 MTA 配置文件：",
+                "search_file",
+                {"target_directory": ".", "pattern": "mta*.yaml", "recursive": True}),
+            "ok": json.dumps(mta_candidates, ensure_ascii=False),
+            "fail": "",
+            "label": "查找 MTA 文件",
+        })
+        steps.append({
+            "key": "copy",
+            "pre": make_call(
+                f"已定位到匹配文件 `{mta_src}`，读取它的完整内容：",
+                "read_file", {"filePath": mta_src}),
+            "ok": mta_content,
+            "fail": "",
+            "label": "读取 MTA 文件",
+        })
+        steps.append({
+            "key": "copy",
+            "pre": make_call(
+                f"将 `{mta_src}` 的完整内容写入项目根目录的 `mta.yaml`"
+                "（不存在就新建，已存在就覆盖）：",
+                "write_to_file", {"filePath": "mta.yaml", "content": mta_content}),
+            "ok": "The file mta.yaml has been written successfully.",
+            "fail": "",
+            "label": "写入 mta.yaml",
+        })
+    else:
+        copy_cmd = (f"$f=(Get-ChildItem -Path . -Recurse -File -Filter {mta} "
+                    "| Select-Object -First 1).FullName; Copy-Item $f -Destination mta.yaml -Force")
+        steps.append({
+            "key": "copy",
+            "pre": shell_call(
+                f"空间 `{code}` 已登录。接下来在项目中查找与 {env_disp} 匹配的 MTA 配置文件 `{mta}`，"
+                f"并把它复制为根目录下的 `mta.yaml`（不存在就新建，已存在就覆盖）：",
+                copy_cmd, False, "查找并复制 MTA 配置为 mta.yaml"),
+            "ok": "",
+            "fail": f"Copy-Item : Cannot find path '{mta}' because it does not exist.",
+            "label": "MTA 文件复制",
+        })
+
+    steps.append({
+        "key": "build",
+        "pre": shell_call(
+            "`mta.yaml` 已就绪。接下来在项目根目录执行 `mbt build` 打包构建"
+            "（超时 600 秒，非交互模式，需等待命令完整返回）：",
+            "mbt build", False, "构建 MTA 项目", True),
+        "ok": make_build_log(mtar_log),
+        "fail": ("[INFO] validating the MTA project\n"
+                 "[ERROR] the MTA project is not valid\n"
+                 "[ERROR] build failed, no archive was generated"),
+        "label": "项目构建（mbt build）",
+    })
+
+    if need_join:
+        deploy_intro = (
+            f"构建完成。取构建日志最后 10 行，匹配到 `the MTA archive generated at: {mtar_log}` 一行，"
+            f"日志给的是相对路径，拼接项目根目录 `{mta_root}` 得到完整路径 `{mtar_full}`。"
+            "接下来执行 `cf deploy` 部署（超时 600 秒，非交互模式，需等待命令完整返回）："
+        )
+    else:
+        deploy_intro = (
+            "构建完成。取构建日志最后 10 行，匹配到 `the MTA archive generated at:` 一行，"
+            f"直接得到完整路径 `{mtar_full}`。"
+            "接下来执行 `cf deploy` 部署（超时 600 秒，非交互模式，需等待命令完整返回）："
+        )
+
+    steps.append({
+        "key": "deploy",
+        "pre": shell_call(
+            deploy_intro,
+            f"cf deploy {mtar_full} -f", True, "部署 MTAR 归档到 BTP", True),
+        "ok": (f"Deploying multi-target app archive {mtar_full} in org my-org / space {code}...\r\n"
+               "Application started\r\n"
+               "Process finished."),
+        "fail": (f"Deploying multi-target app archive {mtar_full}...\r\n"
+                 "[ERROR] Deployment failed: application did not start"),
+        "label": "CF 部署（cf deploy）",
+    })
+
+    steps.append({
+        "key": "clean",
+        "pre": shell_call(
+            "部署动作已返回成功。接下来执行清理，删除临时 `mta.yaml`、`mta_archives` 目录"
+            "以及 `.mta_build_tmp` 等构建产物：",
+            ("Remove-Item -Path mta.yaml, mta_archives, .mta_build_tmp "
+             "-Recurse -Force -ErrorAction SilentlyContinue"),
+            True, "清理临时构建产物"),
+        "ok": "",
+        "fail": "",
+        "label": "环境清理",
+    })
 
     def success_summary():
         return {
@@ -600,15 +741,15 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
                 f"✅ **SAP BTP 构建与部署全流程已完成**\n\n"
                 f"- **目标环境**：{ws} 工作区 / {proj} 项目 / {env_disp}\n"
                 f"- **空间登录**：已登录 space code `{code}`\n"
-                f"- **配置同步**：`{mta}` -> `mta.yaml`\n"
-                f"- **MTA 构建**：`mbt build` 已生成 `{mtar_path}`\n"
+                f"- **配置同步**：`{mta_src}` 的完整内容已写入根目录 `mta.yaml`\n"
+                f"- **MTA 构建**：`mbt build` 已生成，归档完整路径 `{mtar_full}`\n"
                 f"- **CF 部署**：`cf deploy` 执行成功，应用已启动\n"
                 f"- **环境清理**：临时 `mta.yaml` 与构建产物已删除，项目目录已恢复干净状态"
             ),
         }
 
     def error_summary(failed_index, failed_label):
-        done = "、".join(steps[k][3] for k in range(failed_index)) or "无"
+        done = "、".join(s["label"] for s in steps[:failed_index]) or "无"
         return {
             "role": "assistant",
             "content": (
@@ -629,16 +770,16 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
     samples = []
 
     # ---- 冷启动：目标是第 1 步 ----
-    samples.append({"tools": tools_list, "messages": base_messages + [steps[0][0]]})
+    samples.append({"tools": tools_list, "messages": base_messages + [steps[0]["pre"]]})
 
     # ---- 成功链路的前缀展开：每个中途状态的目标都是下一次工具调用 ----
     history = []
-    for index, (pre, ok_result, _fail, _label) in enumerate(steps):
-        history.extend([pre, make_tool_result(pre, ok_result)])
+    for index, step in enumerate(steps):
+        history.extend([step["pre"], make_result(step["pre"], step["ok"])])
         if index + 1 < len(steps):
             samples.append({
                 "tools": tools_list,
-                "messages": base_messages + list(history) + [steps[index + 1][0]],
+                "messages": base_messages + list(history) + [steps[index + 1]["pre"]],
             })
     # ---- 全部步骤走完：目标是最终汇报（唯一允许出现完成态措辞的地方）----
     samples.append({
@@ -648,16 +789,17 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
 
     # ---- 失败分支：第 i 步失败 -> 立即中止并报错，不再发工具调用 ----
     for fail_key in fail_points:
-        fail_index = STEP_ORDER.index(fail_key)
+        fail_index = next(i for i, s in enumerate(steps) if s["key"] == fail_key)
         fail_history = []
         for k in range(fail_index):
-            pre, ok_result, _, _ = steps[k]
-            fail_history.extend([pre, make_tool_result(pre, ok_result)])
-        pre_i, _ok, fail_result, label_i = steps[fail_index]
-        fail_history.extend([pre_i, make_tool_result(pre_i, fail_result)])
+            step = steps[k]
+            fail_history.extend([step["pre"], make_result(step["pre"], step["ok"])])
+        fail_step = steps[fail_index]
+        fail_history.extend([fail_step["pre"], make_result(fail_step["pre"], fail_step["fail"])])
         samples.append({
             "tools": tools_list,
-            "messages": base_messages + list(fail_history) + [error_summary(fail_index, label_i)],
+            "messages": base_messages + list(fail_history)
+                        + [error_summary(fail_index, fail_step["label"])],
         })
 
     return samples
@@ -797,19 +939,30 @@ def build_login_action_samples():
 # 7. 单步原子动作样本（复制 / 构建 / 部署 / 清理）
 # ============================================================
 
-def _devops_step_meta(command):
-    """从命令推断 (一句话说明, 是否长时间命令)，用于非 CodeBuddy 档位的参数填充"""
-    if command.startswith("Invoke-RestMethod"):
-        return "登录 BTP 空间", False
-    if command.startswith("Copy-Item"):
-        return "复制 MTA 配置为 mta.yaml", False
-    if command.startswith("mbt build"):
-        return "构建 MTA 项目", True
-    if command.startswith("cf deploy"):
-        return "部署 MTAR 归档到 BTP", True
-    if command.startswith("Remove-Item"):
-        return "清理临时构建产物", False
-    return "执行命令", False
+def _copy_action_calls(profile, rule, env_str, mta_src, mta_candidates, mta_content, action):
+    """把「找到 mta 文件并复制内容为根目录 mta.yaml」按档位展开成具体工具调用序列。
+
+    CodeBuddy 档位用文件工具：search_file 定位 -> read_file 读内容 -> write_to_file 写 mta.yaml；
+    只有 shell 的档位用一条「递归查找 + 复制」命令。
+
+    返回 [(pre_content, tool, payload, tool_result), ...]；tool="shell" 时 payload 为
+    (command, requires_approval, short_desc, is_long_running)。
+    """
+    if profile["id"] == "codebuddy":
+        return [
+            (f"正在查找与 {env_str} 匹配的 MTA 配置文件：", "search_file",
+             {"target_directory": ".", "pattern": "mta*.yaml", "recursive": True},
+             json.dumps(mta_candidates, ensure_ascii=False)),
+            (f"已定位到 `{mta_src}`，读取它的完整内容：", "read_file",
+             {"filePath": mta_src}, mta_content),
+            (f"将 `{mta_src}` 的完整内容写入根目录 `mta.yaml`：", "write_to_file",
+             {"filePath": "mta.yaml", "content": mta_content},
+             "The file mta.yaml has been written successfully."),
+        ]
+    copy_cmd = (f"$f=(Get-ChildItem -Path . -Recurse -File -Filter {rule['mta']} "
+                "| Select-Object -First 1).FullName; Copy-Item $f -Destination mta.yaml -Force")
+    return [(action["pre_shell"], "shell",
+             (copy_cmd, False, "查找并复制 MTA 配置为 mta.yaml", False), "")]
 
 
 def build_devops_action_samples():
@@ -823,23 +976,24 @@ def build_devops_action_samples():
         env_str = rng.choice(ENV_SYNONYMS[rule["env"]])
         mtar_path = make_mtar_path(proj)
 
+        mta_src, mta_candidates = locate_mta(rule)
+        mta_content = make_mta_content(proj)
+
         actions = []
 
-        # ---- 复制配置 ----
+        # ---- 复制配置（CodeBuddy 档位展开为 查找 / 读取 / 写入 三步）----
         for q in rng.sample([
             f"把 {ws} 工作区 {proj} 项目 {env_str} 对应的 MTA 文件复制到根目录下的 mta.yaml",
-            f"根据规则将 {mta} 覆盖复制为 mta.yaml",
+            "根据规则找到匹配的 MTA 文件并覆盖复制为 mta.yaml",
             f"找到 {proj}（{env_str}）匹配的 YAML 文件并复制到根目录下的 mta.yaml",
-            f"复制 {mta} 到当前目录的 mta.yaml",
+            f"复制与 {env_str} 匹配的 MTA 文件内容到当前目录的 mta.yaml",
         ], k=2):
-            actions.append((
-                q,
-                f"正在将 `{mta}` 覆盖复制为根目录下的 `mta.yaml`：",
-                f"Copy-Item {mta} -Destination mta.yaml -Force",
-                False,
-                "",
-                f"`{mta}` 已复制并覆盖为 `mta.yaml`。",
-            ))
+            actions.append({
+                "kind": "copy",
+                "user": q,
+                "pre_shell": f"正在查找匹配的 MTA 文件 `{mta}` 并复制为根目录下的 `mta.yaml`：",
+                "final_shell": f"`{mta}` 已复制并覆盖为 `mta.yaml`。",
+            })
 
         # ---- mbt build（结果里带回真实日志行，路径由日志决定）----
         for q in rng.sample([
@@ -847,17 +1001,14 @@ def build_devops_action_samples():
             "执行 mbt build 进行 MTA 项目构建",
             "运行 mbt build 打包项目，生成 mtar 文件",
         ], k=2):
-            actions.append((
-                q,
-                "正在执行 `mbt build` 进行项目构建打包：",
-                "mbt build",
-                False,
-                ("[INFO] validating the MTA project\n"
-                 "[INFO] building the MTA project\n"
-                 f"[INFO] the MTA archive generated at: {mtar_path}\n"
-                 "[INFO] cleaning temporary files"),
-                f"MTA 构建完成，构建日志显示归档包为 `{mtar_path}`。",
-            ))
+            actions.append({
+                "kind": "shell", "user": q,
+                "pre": "正在执行 `mbt build` 进行项目构建打包：",
+                "cmd": "mbt build", "approval": False,
+                "desc": "构建 MTA 项目", "long": True,
+                "result": make_build_log(mtar_path),
+                "final": f"MTA 构建完成，构建日志末尾显示归档包为 `{mtar_path}`。",
+            })
 
         # ---- cf deploy（路径由用户在指令中给出）----
         for q in rng.sample([
@@ -865,15 +1016,15 @@ def build_devops_action_samples():
             f"把已构建的归档包 {mtar_path} 部署到 SAP BTP",
             f"运行 cf deploy {mtar_path} -f 完成应用发布",
         ], k=2):
-            actions.append((
-                q,
-                f"正在执行 `cf deploy` 部署 `{mtar_path}`：",
-                f"cf deploy {mtar_path} -f",
-                True,
-                (f"Deploying multi-target app archive {mtar_path} in org my-org / space {ws}...\r\n"
-                 "Application started\r\nProcess finished."),
-                f"CF 部署完成，应用已通过 `{mtar_path}` 成功启动。",
-            ))
+            actions.append({
+                "kind": "shell", "user": q,
+                "pre": f"正在执行 `cf deploy` 部署 `{mtar_path}`：",
+                "cmd": f"cf deploy {mtar_path} -f", "approval": True,
+                "desc": "部署 MTAR 归档到 BTP", "long": True,
+                "result": (f"Deploying multi-target app archive {mtar_path} in org my-org / space {ws}...\r\n"
+                           "Application started\r\nProcess finished."),
+                "final": f"CF 部署完成，应用已通过 `{mtar_path}` 成功启动。",
+            })
 
         # ---- 清理 ----
         for q in rng.sample([
@@ -881,36 +1032,49 @@ def build_devops_action_samples():
             "清理 mta.yaml 和构建产物，恢复项目目录干净状态",
             "删除临时创建的 mta.yaml 和 .mta_build_tmp 临时目录",
         ], k=2):
-            actions.append((
-                q,
-                "正在清理临时 `mta.yaml`、`mta_archives` 与 `.mta_build_tmp`：",
-                ("Remove-Item -Path mta.yaml, mta_archives, .mta_build_tmp "
-                 "-Recurse -Force -ErrorAction SilentlyContinue"),
-                True,
-                "",
-                "清理完成，临时文件与构建产物已删除，项目目录已恢复干净状态。",
-            ))
+            actions.append({
+                "kind": "shell", "user": q,
+                "pre": "正在清理临时 `mta.yaml`、`mta_archives` 与 `.mta_build_tmp`：",
+                "cmd": ("Remove-Item -Path mta.yaml, mta_archives, .mta_build_tmp "
+                        "-Recurse -Force -ErrorAction SilentlyContinue"),
+                "approval": True, "desc": "清理临时构建产物", "long": False,
+                "result": "",
+                "final": "清理完成，临时文件与构建产物已删除，项目目录已恢复干净状态。",
+            })
 
-        for index, (user_text, pre_content, cmd, approval, tool_result, final_text) in enumerate(actions):
-            call_id = f"call_{uuid.uuid4().hex[:8]}"
+        for index, action in enumerate(actions):
             profile = pick_profile()
-            short_desc, is_long_running = _devops_step_meta(cmd)
+
+            if action["kind"] == "copy":
+                calls = _copy_action_calls(profile, rule, env_str, mta_src,
+                                           mta_candidates, mta_content, action)
+                final_text = (f"`{mta_src}` 的完整内容已写入根目录 `mta.yaml`。"
+                              if profile["id"] == "codebuddy" else action["final_shell"])
+            else:
+                calls = [(action["pre"], "shell",
+                          (action["cmd"], action["approval"], action["desc"], action["long"]),
+                          action["result"])]
+                final_text = action["final"]
+
+            messages = [
+                {"role": "system", "content": pick_system_prompt(profile)},
+                {"role": "user", "content": action["user"]},
+            ]
+            for pre_content, tool, payload, tool_result in calls:
+                if tool == "shell":
+                    cmd, approval, desc, is_long = payload
+                    tname = shell_tool_name(profile)
+                    args = build_arguments(profile, cmd, desc, approval, is_long)
+                else:
+                    tname, args = tool, payload
+                call_message = make_call(pre_content, tname, args)
+                messages.append(call_message)
+                messages.append(make_result(call_message, tool_result, tname))
+            messages.append({"role": "assistant", "content": final_text})
+
             pool.append((key, f"devops|{key}|{index}", {
                 "tools": make_tools_list(profile),
-                "messages": [
-                    {"role": "system", "content": pick_system_prompt(profile)},
-                    {"role": "user", "content": user_text},
-                    {"role": "assistant", "content": pre_content, "tool_calls": [{
-                        "id": call_id, "type": "function",
-                        "function": {"name": shell_tool_name(profile),
-                                     "arguments": json.dumps(
-                                         build_arguments(profile, cmd, short_desc, approval, is_long_running),
-                                         ensure_ascii=False)},
-                    }]},
-                    {"role": "tool", "name": shell_tool_name(profile), "tool_call_id": call_id,
-                     "content": tool_result},
-                    {"role": "assistant", "content": final_text},
-                ],
+                "messages": messages,
             }))
 
     return pool
@@ -1345,8 +1509,10 @@ def generate_dataset():
         print(f"        {p['id']:>18s}  权重 {p['weight']:<2d}  工具 {len(p['tools'])} 条"
               f"  命令工具名 `{shell_tool_name(p)}`")
     print("        改权重只需调整 TOOL_PROFILES 里的 weight。")
-    print("[提醒] 每步要执行的 shell 命令（Invoke-RestMethod / Copy-Item / mbt build / "
+    print("[提醒] 每步要执行的命令（Invoke-RestMethod / 查找并复制 mta / mbt build / "
           "cf deploy / Remove-Item）在所有档位里是恒定的 —— 那才是要学的技能。")
+    print("[提醒] 「复制 mta」按档位展开：CodeBuddy 用 search_file -> read_file -> write_to_file，"
+          "其余档位用一条 Get-ChildItem 递归查找 + Copy-Item 命令（mta 文件可能在 mta/ 子目录）。")
     print("[提醒] CodeBuddy 的 execute_command 没有 timeout 参数，"
           "超时要求靠助手旁白表达；Bash 档位则会带 timeout=600000（毫秒）。")
 
