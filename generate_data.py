@@ -32,46 +32,28 @@ SEED = 42
 #     → agent 暴露 9 条工具（去掉没有 schema 可查的 read_rules）
 
 FAIL_BRANCHES_PER_TRAJECTORY = 2
-AMBIGUOUS_REPEAT = 2
+# 采样重复：规则少了之后（14 -> 3），靠重复把「登录 code / mta 文件」映射的曝光量补回来。
+# 基础每条规则 2 轮；歧义规则（code 历史上跨工作区复用）3 轮。
+BASE_REPEAT = 2
+AMBIGUOUS_REPEAT = 3
 
 rng = random.Random(SEED)
 
 
 # ============================================================
-# 1. 来自 config.txt 的 14 条明确业务规则
+# 1. 来自 config.txt 的明确业务规则（仅 MPB 工作区；CMP 相关配置已按需求移除）
 # ============================================================
 
 RULES = [
-    # CMP 工作区
-    {"workspace": "CMP", "project": "CPT", "env": "dev", "code": "162-d-cpt", "mta": "mta-quality.yaml"},
-    {"workspace": "CMP", "project": "PT", "env": "dev", "code": "162-d-pt", "mta": "mta-prequality-pt.yaml"},
-    {"workspace": "CMP", "project": "HC", "env": "dev", "code": "162-d-hc", "mta": "mta-prequality-hc.yaml"},
-    {"workspace": "CMP", "project": "HCS1T", "env": "dev", "code": "162-d-hc", "mta": "mta-prequality-hc-s1t.yaml"},
-    {"workspace": "CMP", "project": "CPT-PT", "env": "dev", "code": "162-d-pt", "mta": "mta-prequality-cpt-pt.yaml"},
-    {"workspace": "CMP", "project": "CPT-PT", "env": "quality", "code": "162-q-pt", "mta": "mta-quality-cpt-pt.yaml"},
-    {"workspace": "CMP", "project": "CPT-HC", "env": "dev", "code": "162-d-hc", "mta": "mta-prequality-cpt-hc.yaml"},
-    {"workspace": "CMP", "project": "CPT-HC", "env": "quality", "code": "162-q-hc", "mta": "mta-quality-cpt-hc.yaml"},
-    {"workspace": "CMP", "project": "CPT", "env": "quality", "code": "162-q-cpt", "mta": "mta-quality.yaml"},
-    {"workspace": "CMP", "project": "PT", "env": "quality", "code": "162-q-pt", "mta": "mta-quality-pt.yaml"},
-    {"workspace": "CMP", "project": "HC", "env": "quality", "code": "162-q-hc", "mta": "mta-quality-hc.yaml"},
     # MPB 工作区
     {"workspace": "MPB", "project": "HC", "env": "dev", "code": "163-d-hc", "mta": "mta-develop-hc.yaml"},
     {"workspace": "MPB", "project": "CPT", "env": "dev", "code": "162-d-cpt", "mta": "mta-develop.yaml"},
     {"workspace": "MPB", "project": "PT", "env": "dev", "code": "162-d-pt", "mta": "mta-develop-pt.yaml"},
 ]
 
-# 极易混淆的规则，需要过采样：
-#   - code 与 mta 不是一一对应（162-d-hc 横跨 HC / HCS1T / CPT-HC；162-q-hc 横跨 HC / CPT-HC）
-#   - 同一个 code 在不同工作区指向不同 mta（162-d-cpt：CMP->mta-quality.yaml，MPB->mta-develop.yaml）
-#   - CMP/CPT 的开发环境用的是 quality 命名的文件（最反直觉）
+# 需要过采样的规则（CMP 工作区移除后歧义已大幅减少；
+# MPB 这两条保留过采样：162-d-cpt / 162-d-pt 在历史上也出现在其它工作区，容易混）
 AMBIGUOUS_KEYS = {
-    ("CMP", "CPT", "dev"),
-    ("CMP", "CPT", "quality"),
-    ("CMP", "HC", "dev"),
-    ("CMP", "HCS1T", "dev"),
-    ("CMP", "HC", "quality"),
-    ("CMP", "CPT-HC", "dev"),
-    ("CMP", "CPT-HC", "quality"),
     ("MPB", "CPT", "dev"),
     ("MPB", "HC", "dev"),
 }
@@ -820,7 +802,7 @@ def build_deploy_chain_samples():
     for rule in RULES:
         key = rule_key(rule)
         is_ambiguous = (rule["workspace"], rule["project"], rule["env"]) in AMBIGUOUS_KEYS
-        repeats = AMBIGUOUS_REPEAT if is_ambiguous else 1
+        repeats = AMBIGUOUS_REPEAT if is_ambiguous else BASE_REPEAT
 
         for rep in range(repeats):
             # ---------- A. agent 形态：SOP 在 system ----------
@@ -1161,57 +1143,13 @@ def build_qa_samples():
                 ],
             }))
 
-    # 跨工作区对比
-    comparisons = [
-        ("HC",
-         "CMP 和 MPB 下的 HC 开发环境有什么区别？",
-         "两者的区别如下：\n- **CMP 工作区**：HC 开发环境的登录 code 是 `162-d-hc`，"
-         "部署 MTA 文件是 `mta-prequality-hc.yaml`。\n- **MPB 工作区**：HC 开发环境的登录 code 是 "
-         "`163-d-hc`，部署 MTA 文件是 `mta-develop-hc.yaml`。"),
-        ("CPT",
-         "CPT 项目在 CMP 和 MPB 的开发环境部署 MTA 文件一样吗？",
-         "不相同，两者的 MTA 部署文件不同：\n- **CMP 工作区**：CPT 开发环境的 MTA 文件是 "
-         "`mta-quality.yaml`（登录 code 是 `162-d-cpt`）。\n- **MPB 工作区**：CPT 开发环境的 "
-         "MTA 文件是 `mta-develop.yaml`（登录 code 同样是 `162-d-cpt`）。"),
-        ("PT",
-         "对比一下 CMP 和 MPB 下 PT 开发环境的配置",
-         "配置对比：\n- **CMP 工作区**：PT 开发环境登录 code 为 `162-d-pt`，MTA 文件为 "
-         "`mta-prequality-pt.yaml`。\n- **MPB 工作区**：PT 开发环境登录 code 为 `162-d-pt`，"
-         "MTA 文件为 `mta-develop-pt.yaml`。"),
-    ]
-    for name, question, answer in comparisons:
-        for index in range(3):
-            profile = pick_profile()
-            pool.append((f"CMPARE|{name}", f"qa-cmp|{name}|{index}", {
-                "tools": make_tools_list(profile),
-                "messages": [
-                    {"role": "system", "content": pick_system_prompt(profile)},
-                    {"role": "user", "content": question},
-                    {"role": "assistant", "content": answer},
-                ],
-            }))
-
-    # 全局列表
+    # 全局列表（跨工作区对比样本已随 CMP 工作区一并移除）
     global_answers = {
         "列出 MPB 工作区下的所有项目和环境配置": (
             "MPB 工作区包含以下 3 个项目的开发环境配置：\n"
             "1. **HC 项目**：登录 code 为 `163-d-hc`，MTA 文件为 `mta-develop-hc.yaml`\n"
             "2. **CPT 项目**：登录 code 为 `162-d-cpt`，MTA 文件为 `mta-develop.yaml`\n"
             "3. **PT 项目**：登录 code 为 `162-d-pt`，MTA 文件为 `mta-develop-pt.yaml`"
-        ),
-        "请列出 CMP 工作区下所有的项目和环境清单": (
-            "CMP 工作区下包含的项目与环境如下：\n"
-            "- **CPT**：开发环境（code: `162-d-cpt`，mta: `mta-quality.yaml`）；"
-            "quality环境（code: `162-q-cpt`，mta: `mta-quality.yaml`）\n"
-            "- **PT**：开发环境（code: `162-d-pt`，mta: `mta-prequality-pt.yaml`）；"
-            "quality环境（code: `162-q-pt`，mta: `mta-quality-pt.yaml`）\n"
-            "- **HC**：开发环境（code: `162-d-hc`，mta: `mta-prequality-hc.yaml`）；"
-            "quality环境（code: `162-q-hc`，mta: `mta-quality-hc.yaml`）\n"
-            "- **HCS1T**：开发环境（code: `162-d-hc`，mta: `mta-prequality-hc-s1t.yaml`）\n"
-            "- **CPT-PT**：开发环境（code: `162-d-pt`，mta: `mta-prequality-cpt-pt.yaml`）；"
-            "quality环境（code: `162-q-pt`，mta: `mta-quality-cpt-pt.yaml`）\n"
-            "- **CPT-HC**：开发环境（code: `162-d-hc`，mta: `mta-prequality-cpt-hc.yaml`）；"
-            "quality环境（code: `162-q-hc`，mta: `mta-quality-cpt-hc.yaml`）"
         ),
     }
     for index, (query, answer) in enumerate(global_answers.items()):

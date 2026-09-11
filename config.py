@@ -9,7 +9,7 @@ IS_KAGGLE = "KAGGLE_KERNEL_RUN_TYPE" in os.environ or Path("/kaggle/working").ex
 # 设置工作路径
 if IS_KAGGLE:
     WORKING_PATH = Path("/kaggle/working")
-    DATA_DIR = Path('/kaggle/input/datasets/xiaonanhaiaichixigua/sftlorabtp/data')
+    DATA_DIR = Path('/kaggle/working/SFTLora/data')
 else:
     WORKING_PATH = Path(__file__).resolve().parent
     DATA_DIR = WORKING_PATH / 'data'
