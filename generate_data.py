@@ -1,9 +1,46 @@
 import json
 import random
+import re
 import uuid
+from collections import defaultdict
 from pathlib import Path
 
+# ============================================================
+# 0. 全局开关
+# ============================================================
+
+SEED = 42
+
+# ============================================================
+# 工具层设计原则（重要）
+# ============================================================
+# 推理时工具定义是 agent 自己注入 prompt 的，模型不需要"背"schema。
+# 但模型必须学会「照着 prompt 里给的那套 schema 发出调用」，这是必须训的能力。
+# 所以这里的原则是：
+#
+#   固定（invariant）  : 任务本身 + 每步要执行的 shell 命令 + 业务映射（code/mta/路径）
+#   随机（augmentation）: 调用外壳 —— 工具名、参数名、菜单里有几个工具、system prompt、语言
+#
+# 权重向 CodeBuddy 倾斜（当前主用 harness），其余档位提供泛化能力，
+# 这样换到别的 agent 时模型能靠 prompt 里的 schema 自适应，而不是死记一个工具名。
+#
+# 证据来源：
+#   C:\CodeBuddy CN\resources\app\extensions\genie\out\extension\index.js
+#     → METADATA_EXECUTE_COMMAND_TOOL / getToolRequiredParams()
+#       CodeBuddy: execute_command, required = ["command", "requires_approval"]，无 timeout
+#   ~/.codebuddy/agents/btp-deploy.md
+#     → agent 暴露 9 条工具（去掉没有 schema 可查的 read_rules）
+
+FAIL_BRANCHES_PER_TRAJECTORY = 2
+AMBIGUOUS_REPEAT = 2
+
+rng = random.Random(SEED)
+
+
+# ============================================================
 # 1. 来自 config.txt 的 14 条明确业务规则
+# ============================================================
+
 RULES = [
     # CMP 工作区
     {"workspace": "CMP", "project": "CPT", "env": "dev", "code": "162-d-cpt", "mta": "mta-quality.yaml"},
@@ -23,347 +60,880 @@ RULES = [
     {"workspace": "MPB", "project": "PT", "env": "dev", "code": "162-d-pt", "mta": "mta-develop-pt.yaml"},
 ]
 
-# 2. 常见 Agent 风格的命令行工具池（支持泛化）
-COMMAND_TOOL_VARIANTS = [
-    {
-        "name": "execute_command",
-        "param": "command",
-        "schema": {
-            "type": "function",
-            "function": {
-                "name": "execute_command",
-                "description": "执行系统命令行命令或终端命令",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "description": "待执行的完整命令行字符串"}
-                    },
-                    "required": ["command"]
-                }
-            }
-        }
-    },
-    {
-        "name": "run_command",
-        "param": "command",
-        "schema": {
-            "type": "function",
-            "function": {
-                "name": "run_command",
-                "description": "在终端中运行指定的 shell 命令",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "description": "要运行的 shell 命令"}
-                    },
-                    "required": ["command"]
-                }
-            }
-        }
-    },
-    {
-        "name": "bash",
-        "param": "cmd",
-        "schema": {
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Run a command in the bash terminal",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cmd": {"type": "string", "description": "The command line to execute"}
-                    },
-                    "required": ["cmd"]
-                }
-            }
-        }
-    },
-    {
-        "name": "terminal",
-        "param": "command",
-        "schema": {
-            "type": "function",
-            "function": {
-                "name": "terminal",
-                "description": "系统终端工具，用于执行命令行指令",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "description": "要执行的命令行指令"}
-                    },
-                    "required": ["command"]
-                }
-            }
-        }
-    },
-    {
-        "name": "run_terminal_cmd",
-        "param": "cmd",
-        "schema": {
-            "type": "function",
-            "function": {
-                "name": "run_terminal_cmd",
-                "description": "执行终端控制台命令",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cmd": {"type": "string", "description": "终端命令"}
-                    },
-                    "required": ["cmd"]
-                }
-            }
-        }
-    },
-    {
-        "name": "powershell",
-        "param": "command",
-        "schema": {
-            "type": "function",
-            "function": {
-                "name": "powershell",
-                "description": "Execute a PowerShell command or script",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "description": "PowerShell command to execute"}
-                    },
-                    "required": ["command"]
-                }
-            }
-        }
-    }
-]
-
-# 3. 干扰工具
-DISTRACTOR_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "读取指定路径的文件内容",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "文件绝对路径"}
-                },
-                "required": ["file_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "写入或覆盖指定文件的内容",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "目标文件路径"},
-                    "content": {"type": "string", "description": "文件内容"}
-                },
-                "required": ["file_path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_directory",
-            "description": "列出指定目录下的所有文件和文件夹",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "directory_path": {"type": "string", "description": "目录路径"}
-                },
-                "required": ["directory_path"]
-            }
-        }
-    }
-]
-
-ENV_SYNONYMS = {
-    "dev": ["开发环境", "开发", "dev", "dev环境", "d环境"],
-    "quality": ["quality环境", "quality", "qa", "qa环境", "测试环境", "q环境"]
+# 极易混淆的规则，需要过采样：
+#   - code 与 mta 不是一一对应（162-d-hc 横跨 HC / HCS1T / CPT-HC；162-q-hc 横跨 HC / CPT-HC）
+#   - 同一个 code 在不同工作区指向不同 mta（162-d-cpt：CMP->mta-quality.yaml，MPB->mta-develop.yaml）
+#   - CMP/CPT 的开发环境用的是 quality 命名的文件（最反直觉）
+AMBIGUOUS_KEYS = {
+    ("CMP", "CPT", "dev"),
+    ("CMP", "CPT", "quality"),
+    ("CMP", "HC", "dev"),
+    ("CMP", "HCS1T", "dev"),
+    ("CMP", "HC", "quality"),
+    ("CMP", "CPT-HC", "dev"),
+    ("CMP", "CPT-HC", "quality"),
+    ("MPB", "CPT", "dev"),
+    ("MPB", "HC", "dev"),
 }
 
-# 4. Action（工具调用类）提示词模版
-ACTION_TEMPLATES = [
-    "帮我准备 {ws} 工作区下 {proj} 项目的 {env}",
-    "请登录 {ws} 的 {proj} {env}，并给我 mta 文件",
-    "登录 {ws} {proj} {env}",
-    "在 {ws} 工作区下部署 {proj} 的 {env}，帮我调登录接口并告知 mta 文件",
-    "需要登录 {proj} 的 {env}，工作区是 {ws}",
-    "准备发布 {ws} 下面的 {proj} 项目 {env}，执行登录",
-    "帮我调一下本地登录 API：工作区 {ws}，项目 {proj}，环境 {env}",
-    "查一下 {ws} - {proj} - {env} 的配置并登录",
-    "请协助登录 {ws} 的 {proj} 项目（{env}），告知对应的 mta 部署文件",
-    "麻烦登录 {ws} 工作区的 {proj} {env}",
-    "{ws} 工作区，{proj} 项目，{env}，帮我登录并输出 mta 文件",
-    "执行 {ws} 中 {proj} 的 {env} 登录",
-    "准备在 {ws} 部署 {proj} {env}，调用登录接口"
+
+def rule_key(rule):
+    return f"{rule['workspace']}|{rule['project']}|{rule['env']}"
+
+
+# ============================================================
+# 2. 工具定义（严格对齐 CodeBuddy 的真实签名）
+# ============================================================
+
+def _tool(name, description, properties, required):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
+
+
+_EXPLANATION_PROP = {
+    "type": "string",
+    "description": "Optional. One sentence explanation of why this tool is used, in the user's language.",
+}
+
+# 描述做了精简：官方原文里 execute_command 单条就 1300+ 字符，9 条工具全量塞进去
+# 光是工具菜单就要 8000+ token，每条样本会撑到 10000 token 以上。
+# 这里保留了 100% 准确的工具名、参数名与 required 列表（这三样决定调用能否被解析），
+# 只压缩了自然语言描述。想要 100% 原文保真，从
+# C:\CodeBuddy CN\resources\app\extensions\genie\out\extension\index.js 里把
+# METADATA_*_TOOL 的 description 贴回来，同时把 main.py 的 MAX_LENGTH 提到 16384。
+CODEBUDDY_TOOL_MENU = [
+    _tool(
+        "list_dir",
+        "Lists files and directories in a given path. target_directory must be returned before other fields.",
+        {
+            "target_directory": {"type": "string", "description": "Path to directory to list contents of."},
+            "ignore_globs": {"type": "array", "description": "Optional glob patterns to ignore."},
+        },
+        ["target_directory"],
+    ),
+    _tool(
+        "search_file",
+        "File search with wildcard pattern matching and recursive directory search. Returns relative paths.",
+        {
+            "target_directory": {"type": "string", "description": "Absolute path to the directory to search in."},
+            "pattern": {"type": "string", "description": 'REQUIRED: File pattern (e.g., "*.js"). Supports wildcards.'},
+            "recursive": {"type": "boolean", "description": "REQUIRED: Set to true to search in subdirectories."},
+            "ignore_globs": {"type": "array", "description": "Optional glob patterns to ignore."},
+        },
+        ["pattern", "recursive"],
+    ),
+    _tool(
+        "search_content",
+        "Search file contents with regular expressions (built on ripgrep). Prefer this over terminal grep/rg.",
+        {
+            "pattern": {"type": "string", "description": "REQUIRED: The regular expression pattern to search for."},
+            "path": {"type": "string", "description": "File or directory to search in. Must be an absolute path."},
+            "glob": {"type": "string", "description": 'Glob pattern to filter files (e.g. "*.js").'},
+        },
+        ["pattern"],
+    ),
+    _tool(
+        "read_file",
+        "Reads a file from the local filesystem. filePath must be an absolute path. "
+        "filePath must be returned before other fields.",
+        {
+            "filePath": {"type": "string",
+                         "description": "REQUIRED: The absolute path of the file to read, NOT a directory."},
+            "offset": {"type": "number", "description": "The line number to start reading from."},
+            "limit": {"type": "number", "description": "The number of lines to read."},
+        },
+        ["filePath"],
+    ),
+    _tool(
+        "read_lints",
+        "Read and display linter errors from the current workspace.",
+        {
+            "paths": {"type": "array", "description": "Optional. File or directory paths to read diagnostics for."},
+            "severity": {"type": "array", "description": 'Optional. Filter by severity, e.g. ["error", "warning"].'},
+        },
+        [],
+    ),
+    _tool(
+        "replace_in_file",
+        "Performs exact string replacements in an existing file. "
+        "REQUIRED PARAMETERS - filePath, old_str and new_str are ALL MANDATORY. "
+        "To create or overwrite a file, prefer write_to_file.",
+        {
+            "filePath": {"type": "string", "description": "REQUIRED: The absolute path of the file to edit."},
+            "old_str": {"type": "string", "description": "REQUIRED: The exact text to replace."},
+            "new_str": {"type": "string", "description": "REQUIRED: The replacement text."},
+            "replace_all": {"type": "boolean", "description": "Replace all occurrences of old_str."},
+        },
+        ["filePath", "old_str", "new_str"],
+    ),
+    _tool(
+        "write_to_file",
+        "Writes a file to the local filesystem, overwriting the existing file if there is one. "
+        "filePath MUST be an absolute path and must be returned before content.",
+        {
+            "filePath": {"type": "string", "description": "REQUIRED: Target file absolute path."},
+            "content": {"type": "string",
+                        "description": "REQUIRED: The complete content to write. Always provide the full file content."},
+            "explanation": _EXPLANATION_PROP,
+        },
+        ["filePath", "content"],
+    ),
+    _tool(
+        "execute_command",
+        "PROPOSE a command to run on behalf of the user.\n"
+        "If you have this tool, note that you DO have the ability to run commands directly on the USER's system. "
+        "Note that the user may have to approve the command before it is executed.\n\n"
+        "In using these tools, adhere to the following guidelines:\n"
+        "1. Execute system commands directly, adapting to the user's OS and shell.\n"
+        "2. By default, the shell will initialize in the project root. If in a new shell, cd to the appropriate "
+        "directory and do necessary setup in addition to running the command.\n"
+        "3. For ANY commands that would require user interaction, ASSUME THE USER IS NOT AVAILABLE TO INTERACT "
+        "and PASS THE NON-INTERACTIVE FLAGS.\n"
+        "4. Dont include any newlines in the command.\n"
+        "5. CRITICAL: Commands touching files outside the workspace need user approval for security.",
+        {
+            "command": {"type": "string",
+                        "description": "The CLI command to execute. Must be valid for the current OS and free of "
+                                       "harmful instructions."},
+            "requires_approval": {
+                "type": "boolean",
+                "description": "Set to true if the command requires user approval. Required for: destructive "
+                               "operations, commands operating outside workspace boundaries, or potentially risky "
+                               "operations. Set to false for safe operations within workspace.",
+            },
+            "explanation": _EXPLANATION_PROP,
+        },
+        ["command", "requires_approval"],
+    ),
+    _tool(
+        "delete_file",
+        "Deletes a file at the specified path. The operation fails gracefully if the file doesn't exist "
+        "or the operation is rejected for security reasons.",
+        {
+            "target_file": {"type": "string",
+                            "description": "REQUIRED: The absolute path of the file to delete."},
+            "explanation": _EXPLANATION_PROP,
+        },
+        ["target_file"],
+    ),
 ]
 
-SYSTEM_PROMPT = "你是一个专业的开发运维助手。根据用户提供的工作区、项目和环境信息，输出对应的登录 code 和 MTA 部署文件；当用户需要执行登录时，使用可用的命令行工具调用本地 API 执行登录；当用户仅查询知识库信息时，直接回答相应信息，无需调用工具。"
+
+# ---------------- 其它 harness 风格的工具定义（用于泛化） ----------------
+
+_BASH_TOOL = _tool(
+    "Bash",
+    "Executes a given bash command in a persistent shell session with optional timeout, "
+    "ensuring proper handling and security measures.\n"
+    "Before executing the command, please follow these steps:\n"
+    "1. Working directory: by default the shell starts in the project root.\n"
+    "2. For commands that require user interaction, pass the non-interactive flags.\n"
+    "3. Avoid using the shell for file operations that dedicated tools can do better.",
+    {
+        "command": {"type": "string", "description": "The command to execute"},
+        "description": {"type": "string",
+                        "description": "Clear, concise description of what this command does in 5-10 words"},
+        "timeout": {"type": "number",
+                    "description": "Optional timeout in milliseconds (max 600000)"},
+    },
+    ["command"],
+)
+
+_TERMINAL_TOOL = _tool(
+    "terminal",
+    "系统终端工具，用于执行命令行指令。命令会在项目根目录下以非交互模式执行。",
+    {
+        "command": {"type": "string", "description": "要执行的命令行指令"},
+    },
+    ["command"],
+)
+
+_RUN_TERMINAL_CMD_TOOL = _tool(
+    "run_terminal_cmd",
+    "请求在用户的终端中执行一条命令。命令会在项目根目录初始化，"
+    "需要交互的命令必须带上非交互参数，并等待命令完整返回。",
+    {
+        "cmd": {"type": "string", "description": "要执行的终端命令"},
+        "explanation": {"type": "string", "description": "一句话说明为什么执行这条命令"},
+    },
+    ["cmd"],
+)
+
+# 每个档位 = 一套真实的 harness 工具签名 + 对应的 arguments 构造规则
+TOOL_PROFILES = [
+    {
+        "id": "codebuddy",
+        "weight": 6,
+        "tools": CODEBUDDY_TOOL_MENU,
+    },
+    {
+        "id": "claude-bash",
+        "weight": 1,
+        "tools": [_BASH_TOOL],
+    },
+    {
+        "id": "terminal",
+        "weight": 1,
+        "tools": [_TERMINAL_TOOL],
+    },
+    {
+        "id": "run_terminal_cmd",
+        "weight": 1,
+        "tools": [_RUN_TERMINAL_CMD_TOOL],
+    },
+]
+
+_profile_bag = []
 
 
-def get_random_tools():
-    """获取包含 1 个命令行工具和 0~2 个干扰工具的随机工具列表"""
-    cmd_tool = random.choice(COMMAND_TOOL_VARIANTS)
-    tools_list = [cmd_tool["schema"]]
-    distractors = random.sample(DISTRACTOR_TOOLS, k=random.choice([0, 1, 2]))
-    tools_list.extend(distractors)
-    random.shuffle(tools_list)
-    return cmd_tool["name"], cmd_tool["param"], tools_list
+def pick_profile():
+    """按权重发牌（袋装抽样），保证各档位占比精确等于 weight 比例，
+    而不是随机抽样那种小样本下的高方差分布。"""
+    global _profile_bag
+    if not _profile_bag:
+        bag = []
+        for p in TOOL_PROFILES:
+            bag.extend([p] * p["weight"])
+        rng.shuffle(bag)
+        _profile_bag = bag
+    return _profile_bag.pop()
 
 
-def build_multiturn_action_samples():
-    """生成原生多轮 Agent 工具交互样本（包含工具调用与结果回传后的自主总结）"""
+# 每个档位里"那个能跑命令的工具"叫什么名字
+_PROFILE_SHELL_TOOL = {
+    "codebuddy": "execute_command",
+    "claude-bash": "Bash",
+    "terminal": "terminal",
+    "run_terminal_cmd": "run_terminal_cmd",
+}
+
+
+def shell_tool_name(profile):
+    return _PROFILE_SHELL_TOOL[profile["id"]]
+
+
+def build_arguments(profile, command, short_desc, requires_approval, is_long_running=False):
+    """按档位构造 tool_call 的 arguments。
+
+    模型要学的正是这件事：参数名照 prompt 里给的 schema 抄，命令本身才是真正的技能。
+    """
+    pid = profile["id"]
+    if pid == "codebuddy":
+        return {"command": command, "requires_approval": requires_approval}
+    if pid == "claude-bash":
+        args = {"command": command, "description": short_desc}
+        if is_long_running:
+            args["timeout"] = 600000
+        return args
+    if pid == "terminal":
+        return {"command": command}
+    if pid == "run_terminal_cmd":
+        return {"cmd": command}
+    raise ValueError(f"未知工具档位: {pid}")
+
+
+def make_tools_list(profile):
+    """返回该档位的工具菜单（深拷贝一份，避免外部改动污染模板）"""
+    return json.loads(json.dumps(profile["tools"], ensure_ascii=False))
+
+
+# ============================================================
+# 3. 环境同义词（中英混合）
+# ============================================================
+
+ENV_SYNONYMS = {
+    "dev": [
+        "开发环境", "开发", "dev", "dev环境", "d环境",
+        "development", "development env", "prequality", "prequality环境",
+    ],
+    "quality": [
+        "quality环境", "quality", "qa", "qa环境", "测试环境", "q环境",
+        "test", "testing", "test env",
+    ],
+}
+
+ENV_DISPLAY = {"dev": "开发环境", "quality": "quality 环境"}
+
+
+# ============================================================
+# 4. 提示词
+# ============================================================
+
+# CodeBuddy craft-agent 系统提示里的行为约束（精简摘录，保留与工具调用强相关的几条）
+_BASE_SYSTEM_PROMPT_CODEBUDDY = (
+    "你是 CodeBuddy 的开发与运维助手，在用户的工作区中直接执行任务。\n\n"
+    "## 沟通与行动\n"
+    "- CRITICAL 简洁回复：一句话描述行动，避免冗长的计划说明\n"
+    "- CRITICAL 言必行：完成行动描述后，务必执行对应的工具\n"
+    "- CRITICAL 工具结果处理：禁止直接呈现工具执行结果给用户，必须理解分析结果内容，为下一步执行提供依据\n\n"
+    "## Shell 执行环境规范\n"
+    "- 使用系统默认的 shell 执行命令（当前环境为 Windows PowerShell）\n"
+    "- 确保命令语法符合当前 shell 的要求，不要使用其他 shell 特有的语法特性\n"
+    "- 在使用 execute_command 时，确保命令能在当前 shell 中正确执行\n"
+    "- 对于需要用户交互的命令，假定用户不可用，必须传入非交互参数，并等待命令完整返回后再继续"
+)
+
+# 非 CodeBuddy 档位使用的中性提示词：不提具体产品名，也不写死 shell
+_BASE_SYSTEM_PROMPT_NEUTRAL = (
+    "你是一个专业的开发与运维助手，在用户的项目工作区中直接执行任务。\n\n"
+    "## 沟通与行动\n"
+    "- 简洁回复：一句话描述行动，避免冗长的计划说明\n"
+    "- 言必行：完成行动描述后，务必执行对应的工具\n"
+    "- 工具结果处理：不要直接复述工具输出，必须理解结果内容，为下一步执行提供依据\n\n"
+    "## Shell 执行环境规范\n"
+    "- 使用系统默认的 shell 执行命令，确保命令语法符合当前 shell 的要求\n"
+    "- 对于需要用户交互的命令，假定用户不可用，必须传入非交互参数\n"
+    "- 长时间命令要设置足够长的超时，并等待命令完整返回后再继续"
+)
+
+_BASE_SYSTEM_PROMPT_NEUTRAL_EN = (
+    "You are a professional DevOps assistant that executes tasks directly in the user's project workspace.\n\n"
+    "## Communication and action\n"
+    "- Keep replies short: one sentence describing the action, no long plans\n"
+    "- Always follow through: after describing the action, actually call the tool\n"
+    "- Never dump raw tool output; interpret it and use it to decide the next step\n\n"
+    "## Shell environment\n"
+    "- Use the system's default shell and make sure the command syntax fits it\n"
+    "- For interactive commands, assume the user is unavailable and pass non-interactive flags\n"
+    "- Set a generous timeout for long-running commands and wait for them to finish"
+)
+
+
+def pick_system_prompt(profile):
+    """system prompt 也要跟着 harness 走：CodeBuddy 档位用 CodeBuddy 风格，其余用中性风格。"""
+    if profile["id"] == "codebuddy":
+        return rng.choice([
+            _BASE_SYSTEM_PROMPT_CODEBUDDY,
+            _BASE_SYSTEM_PROMPT_CODEBUDDY,
+            _BASE_SYSTEM_PROMPT_CODEBUDDY,
+        ])
+    return rng.choice([
+        _BASE_SYSTEM_PROMPT_NEUTRAL,
+        _BASE_SYSTEM_PROMPT_NEUTRAL,
+        _BASE_SYSTEM_PROMPT_NEUTRAL_EN,
+    ])
+
+# btp-deploy agent 的指令正文（= .codebuddy/agents/btp-deploy.md 的内容）。
+# 相比线上版本补了一步「空间登录」，因为部署前必须先登录，否则后续 cf deploy 无法执行。
+DEPLOY_AGENT_INSTRUCTION = (
+    "请根据以下步骤帮我完成 SAP BTP 项目的构建与部署，注意：不要对项目的源代码做任何检查、审查或分析，"
+    "也不要尝试理解或修改代码内容，严格按照下面的步骤直接执行部署操作即可。\n\n"
+    "首先根据目标环境匹配对应的登录 code，调用本地登录接口完成 BTP 空间登录。\n\n"
+    "接着根据部署环境，找到对应的mta文件，找到匹配的 YAML 文件后，将其完整内容复制到根目录下的 mta.yaml 文件中。\n\n"
+    "接着，在项目根目录执行 mbt build 命令进行项目打包，这个构建过程大约需要 2 分钟甚至更久，"
+    "所以必须特别注意 timeout 设置，请将命令超时时间设置得足够长（建议至少 10 分钟 / 600 秒），"
+    "使用非交互模式运行，绝对不要因为 timeout 而中途终止命令，必须等待命令完整返回退出码后再进行下一步。\n\n"
+    "构建完成后，获取构建日志的最后 20 行，从中匹配类似 the MTA archive generated at: 的行，"
+    "提取出 .mtar 文件的完整路径。\n\n"
+    "接着，使用提取到的文件路径执行 cf deploy <构建文件路径> 命令进行部署，这个部署过程同样大约需要 2 分钟甚至更久，"
+    "所以也必须特别注意 timeout 设置，请将命令超时时间设置得足够长（建议至少 10 分钟 / 600 秒），"
+    "使用非交互模式运行，绝对不要因为 timeout 而中途终止命令，必须等待命令完整返回退出码。\n\n"
+    "最后，部署完成后，请进行清理工作：删除之前在根目录下创建的临时 mta.yaml 文件，"
+    "同时删除构建和部署过程中产生的所有多余文件（例如构建日志文件、mta_archives 目录下生成的 .mtar 归档文件、"
+    "以及 .mta_build_tmp 等临时目录和文件），确保项目目录恢复到部署前的干净状态。\n\n"
+    "如果任何步骤失败则中止后续流程并输出错误信息。"
+)
+
+# 用户消息里携带 SOP 的兜底形态（不依赖 agent 配置）
+USER_MESSAGE_SOP = DEPLOY_AGENT_INSTRUCTION + "\n\n当前目标：{target_goal}。"
+
+TARGET_GOAL_TEMPLATES = [
+    "部署到 {ws} 工作区 {proj} 项目的 {env}",
+    "帮我把 {ws} 的 {proj} 项目发布到 {env}",
+    "部署项目：工作区 {ws}，项目 {proj}，环境 {env}",
+    "发布 {ws} 下面的 {proj} {env}",
+    "将 {proj} 部署至 {ws} 工作区的 {env}",
+    "把 {proj} 项目的 {env} 部署到 {ws}",
+]
+
+
+# ============================================================
+# 5. 构建与部署流水线（前缀展开 + 失败分支）
+# ============================================================
+
+MTAR_VERSION_POOL = ["1.0.0", "1.2.0", "2.0.1", "0.9.7", "3.4.0"]
+MTAR_SUFFIX_POOL = ["", "", "", "-srv", "-app", "-db"]
+
+
+def make_mtar_path(project):
+    """随机生成一个真实感的归档路径。
+    故意加入版本号与后缀的变化，避免模型背下 `{proj}_1.0.0.mtar` 这条公式，
+    逼它真的去读构建日志里的 the MTA archive generated at: 那一行。"""
+    base = project.lower()
+    return f"mta_archives/{base}{rng.choice(MTAR_SUFFIX_POOL)}_{rng.choice(MTAR_VERSION_POOL)}.mtar"
+
+
+STEP_ORDER = ["login", "copy", "build", "deploy", "clean"]
+FAILABLE_STEPS = ["login", "copy", "build", "deploy"]
+
+
+def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, fail_points, profile):
+    """针对一条 (规则 x 用户指令) 生成一个完整样本组。
+
+    组内样本 = 全部前缀（冷启动 + 中途推进）+ 成功收尾 + 若干失败中止分支。
+    组内样本共享同一个上下文前缀与同一套工具签名，切分时必须整组进 train 或整组进 val。
+    """
+    ws = rule["workspace"]
+    proj = rule["project"]
+    code = rule["code"]
+    mta = rule["mta"]
+    env_disp = ENV_DISPLAY[rule["env"]]
+
+    tools_list = make_tools_list(profile)
+    tool_name = shell_tool_name(profile)
+    mtar_path = make_mtar_path(proj)
+
+    def make_pre(content, step_key, command, requires_approval, short_desc, is_long_running=False):
+        args = build_arguments(profile, command, short_desc, requires_approval, is_long_running)
+        return {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [{
+                "id": f"call_{step_key}_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
+            }],
+        }
+
+    def make_tool_result(pre_message, content):
+        return {
+            "role": "tool",
+            "name": tool_name,
+            "tool_call_id": pre_message["tool_calls"][0]["id"],
+            "content": content,
+        }
+
+    # 每个 step 形如 (assistant_pre, 成功结果, 失败结果, 中文步骤名)
+    # 中间轮措辞统一为「状态 + 下一步动作 + 冒号」，禁止完成态措辞，
+    # 把「全部完成 / 已就绪」这类收尾语气全部留给 success summary。
+    steps = [
+        (
+            make_pre(
+                f"开始执行部署流程。先完成 {ws} 工作区 {proj} 项目（{env_str}）的空间登录，"
+                f"对应的登录 code 为 `{code}`：",
+                "login",
+                ("Invoke-RestMethod -Uri http://localhost:3000/space/login -Method Post "
+                 f"-ContentType application/json -Body (@{{space='{code}'}}|ConvertTo-Json)"),
+                True,
+                "登录 BTP 空间",
+            ),
+            json.dumps({"code": 200, "data": "success", "message": "success"}, ensure_ascii=False),
+            ("Invoke-RestMethod : The remote server returned an error: (401) Unauthorized.\r\n"
+             f"login failed for space '{code}'"),
+            "空间登录",
+        ),
+        (
+            make_pre(
+                f"空间 `{code}` 已登录。根据目标环境匹配到 MTA 配置文件 `{mta}`，"
+                f"接下来把它覆盖复制为根目录下的 `mta.yaml`：",
+                "copy", f"Copy-Item {mta} -Destination mta.yaml -Force", False,
+                "复制 MTA 配置为 mta.yaml",
+            ),
+            "",
+            f"Copy-Item : Cannot find path '{mta}' because it does not exist.",
+            "MTA 文件复制",
+        ),
+        (
+            make_pre(
+                "`mta.yaml` 已就绪。接下来在项目根目录执行 `mbt build` 打包构建"
+                "（超时 600 秒，非交互模式，需等待命令完整返回）：",
+                "build", "mbt build", False,
+                "构建 MTA 项目", True,
+            ),
+            ("[INFO] validating the MTA project\n"
+             "[INFO] building the MTA project\n"
+             f"[INFO] the MTA archive generated at: {mtar_path}\n"
+             "[INFO] cleaning temporary files"),
+            ("[INFO] validating the MTA project\n"
+             "[ERROR] the MTA project is not valid\n"
+             "[ERROR] build failed, no archive was generated"),
+            "项目构建（mbt build）",
+        ),
+        (
+            make_pre(
+                f"构建完成，从构建日志的最后 20 行中匹配到 `the MTA archive generated at:` 一行，"
+                f"提取出归档路径 `{mtar_path}`。接下来执行 `cf deploy` 部署"
+                "（超时 600 秒，非交互模式，需等待命令完整返回）：",
+                "deploy", f"cf deploy {mtar_path} -f", True,
+                "部署 MTAR 归档到 BTP", True,
+            ),
+            (f"Deploying multi-target app archive {mtar_path} in org my-org / space {code}...\r\n"
+             "Application started\r\n"
+             "Process finished."),
+            (f"Deploying multi-target app archive {mtar_path}...\r\n"
+             "[ERROR] Deployment failed: application did not start"),
+            "CF 部署（cf deploy）",
+        ),
+        (
+            make_pre(
+                "部署动作已返回成功。接下来执行清理，删除临时 `mta.yaml`、`mta_archives` 目录"
+                "以及 `.mta_build_tmp` 等构建产物：",
+                "clean",
+                ("Remove-Item -Path mta.yaml, mta_archives, .mta_build_tmp "
+                 "-Recurse -Force -ErrorAction SilentlyContinue"),
+                True,
+                "清理临时构建产物",
+            ),
+            "",
+            "",
+            "环境清理",
+        ),
+    ]
+
+    def success_summary():
+        return {
+            "role": "assistant",
+            "content": (
+                f"✅ **SAP BTP 构建与部署全流程已完成**\n\n"
+                f"- **目标环境**：{ws} 工作区 / {proj} 项目 / {env_disp}\n"
+                f"- **空间登录**：已登录 space code `{code}`\n"
+                f"- **配置同步**：`{mta}` -> `mta.yaml`\n"
+                f"- **MTA 构建**：`mbt build` 已生成 `{mtar_path}`\n"
+                f"- **CF 部署**：`cf deploy` 执行成功，应用已启动\n"
+                f"- **环境清理**：临时 `mta.yaml` 与构建产物已删除，项目目录已恢复干净状态"
+            ),
+        }
+
+    def error_summary(failed_index, failed_label):
+        done = "、".join(steps[k][3] for k in range(failed_index)) or "无"
+        return {
+            "role": "assistant",
+            "content": (
+                f"❌ **流程已中止**：第 {failed_index + 1} 步「{failed_label}」执行失败。\n\n"
+                f"- **目标环境**：{ws} 工作区 / {proj} 项目 / {env_disp}\n"
+                f"- **已完成步骤**：{done}\n"
+                f"- **失败步骤**：{failed_label}\n"
+                f"- **后续步骤**：已按要求停止，未继续执行\n\n"
+                f"请根据上面的报错信息排查后重试。"
+            ),
+        }
+
+    base_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
     samples = []
+
+    # ---- 冷启动：目标是第 1 步 ----
+    samples.append({"tools": tools_list, "messages": base_messages + [steps[0][0]]})
+
+    # ---- 成功链路的前缀展开：每个中途状态的目标都是下一次工具调用 ----
+    history = []
+    for index, (pre, ok_result, _fail, _label) in enumerate(steps):
+        history.extend([pre, make_tool_result(pre, ok_result)])
+        if index + 1 < len(steps):
+            samples.append({
+                "tools": tools_list,
+                "messages": base_messages + list(history) + [steps[index + 1][0]],
+            })
+    # ---- 全部步骤走完：目标是最终汇报（唯一允许出现完成态措辞的地方）----
+    samples.append({
+        "tools": tools_list,
+        "messages": base_messages + list(history) + [success_summary()],
+    })
+
+    # ---- 失败分支：第 i 步失败 -> 立即中止并报错，不再发工具调用 ----
+    for fail_key in fail_points:
+        fail_index = STEP_ORDER.index(fail_key)
+        fail_history = []
+        for k in range(fail_index):
+            pre, ok_result, _, _ = steps[k]
+            fail_history.extend([pre, make_tool_result(pre, ok_result)])
+        pre_i, _ok, fail_result, label_i = steps[fail_index]
+        fail_history.extend([pre_i, make_tool_result(pre_i, fail_result)])
+        samples.append({
+            "tools": tools_list,
+            "messages": base_messages + list(fail_history) + [error_summary(fail_index, label_i)],
+        })
+
+    return samples
+
+
+def build_deploy_chain_samples():
+    """构建完整部署流水线的前缀展开样本池。
+
+    返回 [(key, group_id, sample), ...]
+
+    两种形态：
+      A. agent 形态（主）—— SOP 在 system prompt 里（对齐 .codebuddy/agents/btp-deploy.md），
+         用户消息只给目标环境。
+      B. 兜底形态 —— SOP 在用户消息里，system prompt 只给通用行为约束。
+    """
+    pool = []
+
+    for rule in RULES:
+        key = rule_key(rule)
+        is_ambiguous = (rule["workspace"], rule["project"], rule["env"]) in AMBIGUOUS_KEYS
+        repeats = AMBIGUOUS_REPEAT if is_ambiguous else 1
+
+        for rep in range(repeats):
+            # ---------- A. agent 形态：SOP 在 system ----------
+            for goal_index, goal_tmpl in enumerate(rng.sample(TARGET_GOAL_TEMPLATES, k=2)):
+                env_str = rng.choice(ENV_SYNONYMS[rule["env"]])
+                user_prompt = goal_tmpl.format(ws=rule["workspace"], proj=rule["project"], env=env_str)
+                fail_points = rng.sample(FAILABLE_STEPS, k=FAIL_BRANCHES_PER_TRAJECTORY)
+                # 每个轨迹组用同一套工具签名（组内所有前缀必须一致，否则模型会自相矛盾）
+                profile = pick_profile()
+                agent_system = pick_system_prompt(profile) + "\n\n" + DEPLOY_AGENT_INSTRUCTION
+                group_id = f"chain-agent|{key}|{rep}|{goal_index}|{profile['id']}"
+                for s in build_trajectory_group(rule, env_str, agent_system, user_prompt,
+                                                group_id, fail_points, profile):
+                    pool.append((key, group_id, s))
+
+            # ---------- B. 兜底形态：SOP 在用户消息 ----------
+            goal_tmpl = rng.choice(TARGET_GOAL_TEMPLATES)
+            env_str = rng.choice(ENV_SYNONYMS[rule["env"]])
+            target_goal = goal_tmpl.format(ws=rule["workspace"], proj=rule["project"], env=env_str)
+            user_prompt = USER_MESSAGE_SOP.format(target_goal=target_goal)
+            fail_points = rng.sample(FAILABLE_STEPS, k=FAIL_BRANCHES_PER_TRAJECTORY)
+            profile = pick_profile()
+            group_id = f"chain-user|{key}|{rep}|{profile['id']}"
+            for s in build_trajectory_group(rule, env_str, pick_system_prompt(profile), user_prompt,
+                                            group_id, fail_points, profile):
+                pool.append((key, group_id, s))
+
+    return pool
+
+
+# ============================================================
+# 6. 登录单点样本（用户只要求登录 / 只查配置）
+# ============================================================
+
+LOGIN_TEMPLATES = [
+    "帮我准备 {ws} 工作区下 {proj} 项目的 {env}",
+    "请登录 {ws} 的 {proj} {env}，并给我 mta 文件",
+    "在 {ws} 工作区下部署 {proj} 的 {env}，帮我调登录接口并告知 mta 文件",
+    "帮我调一下本地登录 API：工作区 {ws}，项目 {proj}，环境 {env}",
+    "请协助登录 {ws} 的 {proj} 项目（{env}），告知对应的 mta 部署文件",
+]
+
+
+def build_login_action_samples():
+    pool = []
+
     for rule in RULES:
         ws = rule["workspace"]
         proj = rule["project"]
         code = rule["code"]
         mta = rule["mta"]
-        env_names = ENV_SYNONYMS[rule["env"]]
-        env_disp = "开发环境" if rule["env"] == "dev" else "quality环境"
+        key = rule_key(rule)
+        env_disp = ENV_DISPLAY[rule["env"]]
 
-        for tmpl in ACTION_TEMPLATES:
-            env_str = random.choice(env_names)
+        for index, tmpl in enumerate(LOGIN_TEMPLATES):
+            env_str = rng.choice(ENV_SYNONYMS[rule["env"]])
             user_text = tmpl.format(ws=ws, proj=proj, env=env_str)
-            tool_name, param_name, tools_list = get_random_tools()
+            profile = pick_profile()
+            tools_list = make_tools_list(profile)
+            tool_name = shell_tool_name(profile)
+            call_id = f"call_login_{uuid.uuid4().hex[:8]}"
+
+            login_cmd = ("Invoke-RestMethod -Uri http://localhost:3000/space/login -Method Post "
+                         f"-ContentType application/json -Body (@{{space='{code}'}}|ConvertTo-Json)")
+            login_args = json.dumps(
+                build_arguments(profile, login_cmd, "登录 BTP 空间", True), ensure_ascii=False)
+
+            tool_res = json.dumps({"code": 200, "data": "success", "message": "success"}, ensure_ascii=False)
+
+            final_success = rng.choice([
+                (f"✅ 登录接口调用完成\n- **工作区**：{ws}\n- **项目**：{proj}（{env_disp}）\n"
+                 f"- **登录 code**：`{code}`\n- **部署 MTA 文件**：`{mta}`\n"
+                 f"空间已就绪，可以继续执行构建与部署。"),
+                (f"已为您完成登录操作：\n1. **项目与环境**：{ws} 工作区 / {proj} 项目（{env_disp}）\n"
+                 f"2. **登录 code**：`{code}`\n3. **MTA 配置文件**：`{mta}`\n"
+                 f"接口调用状态正常。"),
+                (f"登录操作完成\n- 登录 code: `{code}`\n- MTA 部署文件: `{mta}`\n"
+                 f"本地 API 已返回登录成功。"),
+            ])
+
+            group_id = f"login|{key}|{index}"
+
+            pool.append((key, group_id, {
+                "tools": tools_list,
+                "messages": [
+                    {"role": "system", "content": pick_system_prompt(profile)},
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": call_id, "type": "function",
+                        "function": {"name": tool_name, "arguments": login_args},
+                    }]},
+                    {"role": "tool", "name": tool_name, "tool_call_id": call_id, "content": tool_res},
+                    {"role": "assistant", "content": final_success},
+                ],
+            }))
+
+            # 单轮变体：只发出工具调用，训练「首轮直接行动」的行为
+            pool.append((key, group_id, {
+                "tools": tools_list,
+                "messages": [
+                    {"role": "system", "content": pick_system_prompt(profile)},
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant",
+                     "content": f"登录 code: {code}\nMTA 文件: {mta}",
+                     "tool_calls": [{
+                         "id": call_id, "type": "function",
+                         "function": {"name": tool_name, "arguments": login_args},
+                     }]},
+                ],
+            }))
+
+    return pool
+
+
+# ============================================================
+# 7. 单步原子动作样本（复制 / 构建 / 部署 / 清理）
+# ============================================================
+
+def _devops_step_meta(command):
+    """从命令推断 (一句话说明, 是否长时间命令)，用于非 CodeBuddy 档位的参数填充"""
+    if command.startswith("Invoke-RestMethod"):
+        return "登录 BTP 空间", False
+    if command.startswith("Copy-Item"):
+        return "复制 MTA 配置为 mta.yaml", False
+    if command.startswith("mbt build"):
+        return "构建 MTA 项目", True
+    if command.startswith("cf deploy"):
+        return "部署 MTAR 归档到 BTP", True
+    if command.startswith("Remove-Item"):
+        return "清理临时构建产物", False
+    return "执行命令", False
+
+
+def build_devops_action_samples():
+    pool = []
+
+    for rule in RULES:
+        ws = rule["workspace"]
+        proj = rule["project"]
+        mta = rule["mta"]
+        key = rule_key(rule)
+        env_str = rng.choice(ENV_SYNONYMS[rule["env"]])
+        mtar_path = make_mtar_path(proj)
+
+        actions = []
+
+        # ---- 复制配置 ----
+        for q in rng.sample([
+            f"把 {ws} 工作区 {proj} 项目 {env_str} 对应的 MTA 文件复制到根目录下的 mta.yaml",
+            f"根据规则将 {mta} 覆盖复制为 mta.yaml",
+            f"找到 {proj}（{env_str}）匹配的 YAML 文件并复制到根目录下的 mta.yaml",
+            f"复制 {mta} 到当前目录的 mta.yaml",
+        ], k=2):
+            actions.append((
+                q,
+                f"正在将 `{mta}` 覆盖复制为根目录下的 `mta.yaml`：",
+                f"Copy-Item {mta} -Destination mta.yaml -Force",
+                False,
+                "",
+                f"`{mta}` 已复制并覆盖为 `mta.yaml`。",
+            ))
+
+        # ---- mbt build（结果里带回真实日志行，路径由日志决定）----
+        for q in rng.sample([
+            f"在项目根目录执行 mbt build 命令对 {proj} 项目进行打包",
+            "执行 mbt build 进行 MTA 项目构建",
+            "运行 mbt build 打包项目，生成 mtar 文件",
+        ], k=2):
+            actions.append((
+                q,
+                "正在执行 `mbt build` 进行项目构建打包：",
+                "mbt build",
+                False,
+                ("[INFO] validating the MTA project\n"
+                 "[INFO] building the MTA project\n"
+                 f"[INFO] the MTA archive generated at: {mtar_path}\n"
+                 "[INFO] cleaning temporary files"),
+                f"MTA 构建完成，构建日志显示归档包为 `{mtar_path}`。",
+            ))
+
+        # ---- cf deploy（路径由用户在指令中给出）----
+        for q in rng.sample([
+            f"使用构建日志中的路径执行 cf deploy {mtar_path} -f 进行部署",
+            f"把已构建的归档包 {mtar_path} 部署到 SAP BTP",
+            f"运行 cf deploy {mtar_path} -f 完成应用发布",
+        ], k=2):
+            actions.append((
+                q,
+                f"正在执行 `cf deploy` 部署 `{mtar_path}`：",
+                f"cf deploy {mtar_path} -f",
+                True,
+                (f"Deploying multi-target app archive {mtar_path} in org my-org / space {ws}...\r\n"
+                 "Application started\r\nProcess finished."),
+                f"CF 部署完成，应用已通过 `{mtar_path}` 成功启动。",
+            ))
+
+        # ---- 清理 ----
+        for q in rng.sample([
+            "部署完成后进行清理：删除临时 mta.yaml、mta_archives 目录及临时构建文件",
+            "清理 mta.yaml 和构建产物，恢复项目目录干净状态",
+            "删除临时创建的 mta.yaml 和 .mta_build_tmp 临时目录",
+        ], k=2):
+            actions.append((
+                q,
+                "正在清理临时 `mta.yaml`、`mta_archives` 与 `.mta_build_tmp`：",
+                ("Remove-Item -Path mta.yaml, mta_archives, .mta_build_tmp "
+                 "-Recurse -Force -ErrorAction SilentlyContinue"),
+                True,
+                "",
+                "清理完成，临时文件与构建产物已删除，项目目录已恢复干净状态。",
+            ))
+
+        for index, (user_text, pre_content, cmd, approval, tool_result, final_text) in enumerate(actions):
             call_id = f"call_{uuid.uuid4().hex[:8]}"
-
-            curl_cmd = f"curl -X POST http://localhost:3000/space/login -H \"Content-Type: application/json\" -d '{{\"space\": \"{code}\"}}'"
-            tool_args = {param_name: curl_cmd}
-
-            # 1. 成功回传分支 (Success Multi-turn)
-            tool_res_success = random.choice([
-                json.dumps({"status": "success", "code": 200, "message": f"Successfully logged into space {code}"}, ensure_ascii=False),
-                json.dumps({"success": True, "space": code, "output": "Login successful"}, ensure_ascii=False),
-                f"HTTP/1.1 200 OK\nContent-Type: application/json\n\n{{\"status\": 200, \"space\": \"{code}\"}}"
-            ])
-
-            assistant_final_success = random.choice([
-                f"✅ 登录接口已成功调用！\n- **工作区**：{ws}\n- **项目**：{proj}（{env_disp}）\n- **登录 code**：`{code}`\n- **部署 MTA 文件**：`{mta}`\n开发环境已就绪，可以开始后续开发部署。",
-                f"已成功为您完成登录操作：\n1. **项目与环境**：{ws} 工作区 / {proj} 项目（{env_disp}）\n2. **登录 code**：`{code}`\n3. **MTA 配置文件**：`{mta}`\n接口调用状态正常，环境已准备就绪。",
-                f"登录操作完成！\n- 登录 code: `{code}`\n- MTA 部署文件: `{mta}`\n本地 API 返回登录成功。"
-            ])
-
-            multi_turn_sample = {
-                "tools": tools_list,
+            profile = pick_profile()
+            short_desc, is_long_running = _devops_step_meta(cmd)
+            pool.append((key, f"devops|{key}|{index}", {
+                "tools": make_tools_list(profile),
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": pick_system_prompt(profile)},
                     {"role": "user", "content": user_text},
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [
-                            {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": tool_name,
-                                    "arguments": json.dumps(tool_args, ensure_ascii=False)
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        "role": "tool",
-                        "name": tool_name,
-                        "tool_call_id": call_id,
-                        "content": tool_res_success
-                    },
-                    {
-                        "role": "assistant",
-                        "content": assistant_final_success
-                    }
-                ]
-            }
-            samples.append(multi_turn_sample)
+                    {"role": "assistant", "content": pre_content, "tool_calls": [{
+                        "id": call_id, "type": "function",
+                        "function": {"name": shell_tool_name(profile),
+                                     "arguments": json.dumps(
+                                         build_arguments(profile, cmd, short_desc, approval, is_long_running),
+                                         ensure_ascii=False)},
+                    }]},
+                    {"role": "tool", "name": shell_tool_name(profile), "tool_call_id": call_id,
+                     "content": tool_result},
+                    {"role": "assistant", "content": final_text},
+                ],
+            }))
 
-            # 2. 失败异常回传分支 (Error Multi-turn) - 少量样本提升健壮性
-            if random.random() < 0.2:
-                tool_res_error = json.dumps({"status": 500, "error": "Connection refused to http://localhost:3000/space/login"}, ensure_ascii=False)
-                assistant_final_error = f"❌ 调用登录接口失败（连接本地 3000 端口被拒绝）。\n- 目标登录 code：`{code}`\n- 部署 MTA 文件：`{mta}`\n请检查本地登录服务是否正常启动后重试。"
+    return pool
 
-                error_sample = {
-                    "tools": tools_list,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_text},
-                        {
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [
-                                {
-                                    "id": call_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_name,
-                                        "arguments": json.dumps(tool_args, ensure_ascii=False)
-                                    }
-                                }
-                            ]
-                        },
-                        {
-                            "role": "tool",
-                            "name": tool_name,
-                            "tool_call_id": call_id,
-                            "content": tool_res_error
-                        },
-                        {
-                            "role": "assistant",
-                            "content": assistant_final_error
-                        }
-                    ]
-                }
-                samples.append(error_sample)
 
-            # 3. 单轮直接 Action 分支 (Single-turn Action) - 兼容单轮客户端
-            single_turn_sample = {
-                "tools": tools_list,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_text},
-                    {
-                        "role": "assistant",
-                        "content": f"登录 code: {code}\nMTA 文件: {mta}",
-                        "tool_calls": [
-                            {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": tool_name,
-                                    "arguments": json.dumps(tool_args, ensure_ascii=False)
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-            samples.append(single_turn_sample)
-
-    return samples
-
+# ============================================================
+# 8. 知识库问答样本（不触发 tool_call）
+# ============================================================
 
 def build_qa_samples():
-    """生成纯知识库问答样本（不触发 tool_call，即便上下文里有 tools）"""
-    samples = []
+    pool = []
 
-    # A. 正向单点查询：只查 code 或 只查 mta
     code_templates = [
         "{ws} 工作区下 {proj} 项目的 {env} 登录 code 是多少？",
         "查一下 {ws} 的 {proj} {env} 对应的登录 code",
+        "请问在 {ws} 里的 {proj}（{env}）登录 code 是什么",
         "{ws} {proj} {env} 的登陆 code 是什么？",
-        "请问在 {ws} 里的 {proj}（{env}）登录 code 是什么"
     ]
     mta_templates = [
         "{ws} 工作区下 {proj} 项目的 {env} 部署 mta 文件是什么？",
         "请问 {ws} 的 {proj} {env} 用的 mta 文件叫什么？",
+        "{ws} 工作区中 {proj} 的 {env} 对应哪个 mta yaml？",
         "{ws} {proj} {env} 的 mta 部署配置文件名？",
-        "{ws} 工作区中 {proj} 的 {env} 对应哪个 mta yaml？"
     ]
 
     for rule in RULES:
@@ -371,156 +941,377 @@ def build_qa_samples():
         proj = rule["project"]
         code = rule["code"]
         mta = rule["mta"]
-        env_raw = rule["env"]
-        env_names = ENV_SYNONYMS[env_raw]
+        key = rule_key(rule)
+        env_names = ENV_SYNONYMS[rule["env"]]
 
-        # 查 code
-        for tmpl in code_templates:
-            env_str = random.choice(env_names)
-            _, _, tools_list = get_random_tools()
-            samples.append({
-                "tools": tools_list,
+        for index, tmpl in enumerate(code_templates):
+            profile = pick_profile()
+            pool.append((key, f"qa-code|{key}|{index}", {
+                "tools": make_tools_list(profile),
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": tmpl.format(ws=ws, proj=proj, env=env_str)},
-                    {"role": "assistant", "content": f"{ws} 工作区下 {proj} 项目 {env_names[0]}的登录 code 是 `{code}`。"}
-                ]
-            })
+                    {"role": "system", "content": pick_system_prompt(profile)},
+                    {"role": "user", "content": tmpl.format(ws=ws, proj=proj, env=rng.choice(env_names))},
+                    {"role": "assistant",
+                     "content": f"{ws} 工作区下 {proj} 项目 {env_names[0]}的登录 code 是 `{code}`。"},
+                ],
+            }))
 
-        # 查 mta
-        for tmpl in mta_templates:
-            env_str = random.choice(env_names)
-            _, _, tools_list = get_random_tools()
-            samples.append({
-                "tools": tools_list,
+        for index, tmpl in enumerate(mta_templates):
+            profile = pick_profile()
+            pool.append((key, f"qa-mta|{key}|{index}", {
+                "tools": make_tools_list(profile),
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": tmpl.format(ws=ws, proj=proj, env=env_str)},
-                    {"role": "assistant", "content": f"{ws} 工作区下 {proj} 项目 {env_names[0]}的部署 MTA 文件是 `{mta}`。"}
-                ]
-            })
+                    {"role": "system", "content": pick_system_prompt(profile)},
+                    {"role": "user", "content": tmpl.format(ws=ws, proj=proj, env=rng.choice(env_names))},
+                    {"role": "assistant",
+                     "content": f"{ws} 工作区下 {proj} 项目 {env_names[0]}的部署 MTA 文件是 `{mta}`。"},
+                ],
+            }))
 
-    # B. 反向查询：根据 code 查归属
-    code_to_rules = {}
-    for r in RULES:
-        code_to_rules.setdefault(r["code"], []).append(r)
+    # 反向查询：code -> 归属
+    code_to_rules = defaultdict(list)
+    for rule in RULES:
+        code_to_rules[rule["code"]].append(rule)
 
     for code, matched in code_to_rules.items():
-        _, _, tools_list = get_random_tools()
-        user_queries = [
+        info_lines = []
+        for rule in matched:
+            info_lines.append(
+                f"- **{rule['workspace']} 工作区** 的 **{rule['project']} 项目**"
+                f"（{ENV_DISPLAY[rule['env']]}，MTA: `{rule['mta']}`）"
+            )
+        response = f"登录 code `{code}` 对应的项目与环境如下：\n" + "\n".join(info_lines)
+
+        for index, query in enumerate([
             f"登录 code `{code}` 对应的是哪个项目和环境？",
             f"code 是 `{code}` 的环境有哪些？",
-            f"谁使用登录 code `{code}`？"
-        ]
-        info_lines = []
-        for r in matched:
-            env_disp = "开发环境" if r["env"] == "dev" else "quality环境"
-            info_lines.append(f"- **{r['workspace']} 工作区** 的 **{r['project']} 项目**（{env_disp}，MTA: `{r['mta']}`）")
-        resp = f"登录 code `{code}` 对应的项目与环境如下：\n" + "\n".join(info_lines)
-
-        for uq in user_queries:
-            samples.append({
-                "tools": tools_list,
+            f"谁使用登录 code `{code}`？",
+        ]):
+            profile = pick_profile()
+            pool.append((f"CODEquery|{code}", f"qa-rev|{code}|{index}", {
+                "tools": make_tools_list(profile),
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": uq},
-                    {"role": "assistant", "content": resp}
-                ]
-            })
+                    {"role": "system", "content": pick_system_prompt(profile)},
+                    {"role": "user", "content": query},
+                    {"role": "assistant", "content": response},
+                ],
+            }))
 
-    # C. 跨工作区对比（HC, CPT, PT 在 CMP 与 MPB 下的区别）
+    # 跨工作区对比
     comparisons = [
-        (
-            "HC",
-            "CMP 和 MPB 下的 HC 开发环境有什么区别？",
-            "两者的区别如下：\n- **CMP 工作区**：HC 开发环境的登录 code 是 `162-d-hc`，部署 MTA 文件是 `mta-prequality-hc.yaml`。\n- **MPB 工作区**：HC 开发环境的登录 code 是 `163-d-hc`，部署 MTA 文件是 `mta-develop-hc.yaml`。"
-        ),
-        (
-            "CPT",
-            "CPT 项目在 CMP 和 MPB 的开发环境部署 MTA 文件一样吗？",
-            "不相同，两者的 MTA 部署文件不同：\n- **CMP 工作区**：CPT 开发环境的 MTA 文件是 `mta-quality.yaml`（登录 code 是 `162-d-cpt`）。\n- **MPB 工作区**：CPT 开发环境的 MTA 文件是 `mta-develop.yaml`（登录 code 同样是 `162-d-cpt`）。"
-        ),
-        (
-            "PT",
-            "对比一下 CMP 和 MPB 下 PT 开发环境的配置",
-            "配置对比：\n- **CMP 工作区**：PT 开发环境登录 code 为 `162-d-pt`，MTA 文件为 `mta-prequality-pt.yaml`。\n- **MPB 工作区**：PT 开发环境登录 code 为 `162-d-pt`，MTA 文件为 `mta-develop-pt.yaml`。"
-        )
+        ("HC",
+         "CMP 和 MPB 下的 HC 开发环境有什么区别？",
+         "两者的区别如下：\n- **CMP 工作区**：HC 开发环境的登录 code 是 `162-d-hc`，"
+         "部署 MTA 文件是 `mta-prequality-hc.yaml`。\n- **MPB 工作区**：HC 开发环境的登录 code 是 "
+         "`163-d-hc`，部署 MTA 文件是 `mta-develop-hc.yaml`。"),
+        ("CPT",
+         "CPT 项目在 CMP 和 MPB 的开发环境部署 MTA 文件一样吗？",
+         "不相同，两者的 MTA 部署文件不同：\n- **CMP 工作区**：CPT 开发环境的 MTA 文件是 "
+         "`mta-quality.yaml`（登录 code 是 `162-d-cpt`）。\n- **MPB 工作区**：CPT 开发环境的 "
+         "MTA 文件是 `mta-develop.yaml`（登录 code 同样是 `162-d-cpt`）。"),
+        ("PT",
+         "对比一下 CMP 和 MPB 下 PT 开发环境的配置",
+         "配置对比：\n- **CMP 工作区**：PT 开发环境登录 code 为 `162-d-pt`，MTA 文件为 "
+         "`mta-prequality-pt.yaml`。\n- **MPB 工作区**：PT 开发环境登录 code 为 `162-d-pt`，"
+         "MTA 文件为 `mta-develop-pt.yaml`。"),
     ]
-    for proj_name, q, a in comparisons:
-        for _ in range(3):
-            _, _, tools_list = get_random_tools()
-            samples.append({
-                "tools": tools_list,
+    for name, question, answer in comparisons:
+        for index in range(3):
+            profile = pick_profile()
+            pool.append((f"CMPARE|{name}", f"qa-cmp|{name}|{index}", {
+                "tools": make_tools_list(profile),
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": q},
-                    {"role": "assistant", "content": a}
-                ]
-            })
+                    {"role": "system", "content": pick_system_prompt(profile)},
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": answer},
+                ],
+            }))
 
-    # D. 全局列表查询
-    _, _, tools_list = get_random_tools()
-    samples.append({
-        "tools": tools_list,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "列出 MPB 工作区下的所有项目和环境配置"},
-            {
-                "role": "assistant",
-                "content": (
-                    "MPB 工作区包含以下 3 个项目的开发环境配置：\n"
-                    "1. **HC 项目**：登录 code 为 `163-d-hc`，MTA 文件为 `mta-develop-hc.yaml`\n"
-                    "2. **CPT 项目**：登录 code 为 `162-d-cpt`，MTA 文件为 `mta-develop.yaml`\n"
-                    "3. **PT 项目**：登录 code 为 `162-d-pt`，MTA 文件为 `mta-develop-pt.yaml`"
-                )
-            }
-        ]
-    })
-    samples.append({
-        "tools": tools_list,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "请列出 CMP 工作区下所有的项目和环境清单"},
-            {
-                "role": "assistant",
-                "content": (
-                    "CMP 工作区下包含的项目与环境如下：\n"
-                    "- **CPT**：开发环境（code: `162-d-cpt`，mta: `mta-quality.yaml`）；quality环境（code: `162-q-cpt`，mta: `mta-quality.yaml`）\n"
-                    "- **PT**：开发环境（code: `162-d-pt`，mta: `mta-prequality-pt.yaml`）；quality环境（code: `162-q-pt`，mta: `mta-quality-pt.yaml`）\n"
-                    "- **HC**：开发环境（code: `162-d-hc`，mta: `mta-prequality-hc.yaml`）；quality环境（code: `162-q-hc`，mta: `mta-quality-hc.yaml`）\n"
-                    "- **HCS1T**：开发环境（code: `162-d-hc`，mta: `mta-prequality-hc-s1t.yaml`）\n"
-                    "- **CPT-PT**：开发环境（code: `162-d-pt`，mta: `mta-prequality-cpt-pt.yaml`）；quality环境（code: `162-q-pt`，mta: `mta-quality-cpt-pt.yaml`）\n"
-                    "- **CPT-HC**：开发环境（code: `162-d-hc`，mta: `mta-prequality-cpt-hc.yaml`）；quality环境（code: `162-q-hc`，mta: `mta-quality-cpt-hc.yaml`）"
-                )
-            }
-        ]
-    })
+    # 全局列表
+    global_answers = {
+        "列出 MPB 工作区下的所有项目和环境配置": (
+            "MPB 工作区包含以下 3 个项目的开发环境配置：\n"
+            "1. **HC 项目**：登录 code 为 `163-d-hc`，MTA 文件为 `mta-develop-hc.yaml`\n"
+            "2. **CPT 项目**：登录 code 为 `162-d-cpt`，MTA 文件为 `mta-develop.yaml`\n"
+            "3. **PT 项目**：登录 code 为 `162-d-pt`，MTA 文件为 `mta-develop-pt.yaml`"
+        ),
+        "请列出 CMP 工作区下所有的项目和环境清单": (
+            "CMP 工作区下包含的项目与环境如下：\n"
+            "- **CPT**：开发环境（code: `162-d-cpt`，mta: `mta-quality.yaml`）；"
+            "quality环境（code: `162-q-cpt`，mta: `mta-quality.yaml`）\n"
+            "- **PT**：开发环境（code: `162-d-pt`，mta: `mta-prequality-pt.yaml`）；"
+            "quality环境（code: `162-q-pt`，mta: `mta-quality-pt.yaml`）\n"
+            "- **HC**：开发环境（code: `162-d-hc`，mta: `mta-prequality-hc.yaml`）；"
+            "quality环境（code: `162-q-hc`，mta: `mta-quality-hc.yaml`）\n"
+            "- **HCS1T**：开发环境（code: `162-d-hc`，mta: `mta-prequality-hc-s1t.yaml`）\n"
+            "- **CPT-PT**：开发环境（code: `162-d-pt`，mta: `mta-prequality-cpt-pt.yaml`）；"
+            "quality环境（code: `162-q-pt`，mta: `mta-quality-cpt-pt.yaml`）\n"
+            "- **CPT-HC**：开发环境（code: `162-d-hc`，mta: `mta-prequality-cpt-hc.yaml`）；"
+            "quality环境（code: `162-q-hc`，mta: `mta-quality-cpt-hc.yaml`）"
+        ),
+    }
+    for index, (query, answer) in enumerate(global_answers.items()):
+        profile = pick_profile()
+        pool.append(("GLOBAL", f"qa-list|{index}", {
+            "tools": make_tools_list(profile),
+            "messages": [
+                {"role": "system", "content": pick_system_prompt(profile)},
+                {"role": "user", "content": query},
+                {"role": "assistant", "content": answer},
+            ],
+        }))
 
-    return samples
+    return pool
 
+
+# ============================================================
+# 9. 按分组切分（杜绝同一条轨迹跨 train / val）
+# ============================================================
+
+def split_by_group(pool, val_ratio=0.15):
+    """先按业务 key 分层，再在层内按 group_id 整组切分。
+
+    这样既保证同一条轨迹（含它的所有前缀与失败分支）不会同时出现在
+    train 和 val，也保证每个业务规则都会出现在验证集里。
+
+    返回 (train, val, train_group_ids, val_group_ids)
+    """
+    buckets = defaultdict(lambda: defaultdict(list))
+    for key, group_id, sample in pool:
+        buckets[key][group_id].append(sample)
+
+    train, val = [], []
+    train_gids, val_gids = set(), set()
+
+    for key, groups in buckets.items():
+        group_ids = list(groups)
+        rng.shuffle(group_ids)
+        if len(group_ids) <= 1:
+            n_val = 0
+        else:
+            n_val = max(1, int(round(len(group_ids) * val_ratio)))
+        for gid in group_ids[:n_val]:
+            val.extend(groups[gid])
+            val_gids.add(gid)
+        for gid in group_ids[n_val:]:
+            train.extend(groups[gid])
+            train_gids.add(gid)
+
+    rng.shuffle(train)
+    rng.shuffle(val)
+    return train, val, train_gids, val_gids
+
+
+# ============================================================
+# 10. 生成后自检
+# ============================================================
+# 这一节检查的都是「会静默毁掉训练」的坑：工具名不在菜单里、必填参数缺失、
+# 参数未在 schema 里声明、tool 结果与调用配对错位、同组内工具签名不一致。
+# 这些错误不会让脚本崩，只会让模型训出来是废的，所以必须在生成完立刻拦住。
+
+_ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
+
+
+def read_jsonl(path):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def validate_structure(rows, label):
+    """消息序列的结构检查：role 合法、有 system 和 user、最后一条必须是 assistant。"""
+    issues = []
+    for i, row in enumerate(rows):
+        messages = row.get("messages") or []
+        if not messages:
+            issues.append(f"{label}#{i} 没有 messages")
+            continue
+        bad_roles = [m.get("role") for m in messages if m.get("role") not in _ALLOWED_ROLES]
+        if bad_roles:
+            issues.append(f"{label}#{i} 出现非法 role: {bad_roles}")
+        if messages[0].get("role") != "system":
+            issues.append(f"{label}#{i} 第一条不是 system")
+        if not any(m.get("role") == "user" for m in messages):
+            issues.append(f"{label}#{i} 没有 user 消息")
+        if messages[-1].get("role") != "assistant":
+            issues.append(f"{label}#{i} 最后一条不是 assistant（模型没有监督目标）")
+    return issues
+
+
+def validate_tool_calls(rows, label):
+    """tool_call 必须与样本自带的工具菜单自洽。"""
+    issues = []
+    for i, row in enumerate(rows):
+        schemas = {t["function"]["name"]: t["function"] for t in row.get("tools") or []}
+        calls = {}
+        for m in row["messages"]:
+            for tc in m.get("tool_calls") or []:
+                fn = tc["function"]
+                if fn["name"] not in schemas:
+                    issues.append(f"{label}#{i} 工具名不在菜单中: {fn['name']}")
+                    continue
+                calls[tc["id"]] = fn["name"]
+                spec = schemas[fn["name"]]["parameters"]
+                try:
+                    args = json.loads(fn["arguments"])
+                except Exception as exc:
+                    issues.append(f"{label}#{i} arguments 不是合法 JSON: {exc}")
+                    continue
+                for req in spec.get("required", []):
+                    if req not in args:
+                        issues.append(f"{label}#{i} {fn['name']} 缺少必填参数 {req}，"
+                                      f"实参 {sorted(args)}")
+                for key in args:
+                    if key not in spec.get("properties", {}):
+                        issues.append(f"{label}#{i} {fn['name']} 参数未在 schema 声明: {key}")
+            if m.get("role") == "tool":
+                if m.get("name") not in schemas:
+                    issues.append(f"{label}#{i} tool 结果的 name 不在菜单中: {m.get('name')}")
+                if m.get("tool_call_id") not in calls:
+                    issues.append(f"{label}#{i} tool 结果找不到对应调用: {m.get('tool_call_id')}")
+                elif m["name"] != calls[m["tool_call_id"]]:
+                    issues.append(f"{label}#{i} tool 结果 name 与调用不一致: "
+                                  f"{m['name']} vs {calls[m['tool_call_id']]}")
+    return issues
+
+
+def validate_group_consistency(pool):
+    """同一个轨迹组内必须共用同一套工具菜单。
+
+    前缀展开出来的样本共享同一段上下文，如果组内工具签名不同，
+    同一条轨迹的历史会自相矛盾（上一轮叫 execute_command，下一轮叫 Bash）。
+    """
+    issues = []
+    seen = {}
+    for _key, group_id, row in pool:
+        fingerprint = tuple(sorted(t["function"]["name"] for t in row.get("tools") or []))
+        if group_id in seen and seen[group_id] != fingerprint:
+            issues.append(f"轨迹组 {group_id} 内工具菜单不一致")
+        seen[group_id] = fingerprint
+    return issues
+
+
+def estimate_tokens(text):
+    """粗略估算 token 数（中文 1 token/字，其余 0.3 token/字符）。
+    真实值以 main.py 里 tokenizer 实测为准，这里只用来快速发现异常长的样本。"""
+    cjk = len(re.findall(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]", text))
+    return int(cjk + (len(text) - cjk) * 0.30)
+
+
+def estimate_sample_tokens(row):
+    parts = [json.dumps(t, ensure_ascii=False) for t in row.get("tools") or []]
+    for m in row["messages"]:
+        parts.append(str(m.get("content") or ""))
+        for tc in m.get("tool_calls") or []:
+            parts.append(json.dumps(tc, ensure_ascii=False))
+    return estimate_tokens("\n".join(parts))
+
+
+def summarize(rows, label):
+    """打印工具档位分布 / 监督目标分布 / 长度估算"""
+    menu_counter = defaultdict(int)
+    for row in rows:
+        menu_counter[tuple(sorted(t["function"]["name"] for t in row.get("tools") or []))] += 1
+
+    print(f"\n[{label}] 工具档位分布:")
+    for menu, count in sorted(menu_counter.items(), key=lambda kv: -kv[1]):
+        if len(menu) == 1:
+            tag = menu[0]
+        else:
+            tag = f"{len(menu)} 条工具（{menu[0] if menu else '?'} 等）"
+        print(f"    {count:5d} 条  {tag}")
+
+    behavior = defaultdict(int)
+    for row in rows:
+        messages = row["messages"]
+        last = messages[-1]
+        has_prior_tool = any(m.get("role") == "tool" for m in messages[:-1])
+        if has_prior_tool and last.get("tool_calls"):
+            behavior["拿到工具结果后继续调下一个工具"] += 1
+        elif has_prior_tool:
+            behavior["拿到工具结果后输出文本收尾"] += 1
+        elif last.get("tool_calls"):
+            behavior["冷启动首轮直接发工具调用"] += 1
+        else:
+            behavior["纯文本问答（不调工具）"] += 1
+
+    print(f"[{label}] 监督目标分布:")
+    for name, count in sorted(behavior.items(), key=lambda kv: -kv[1]):
+        print(f"    {count:5d} 条  {name}")
+
+    sizes = [estimate_sample_tokens(r) for r in rows]
+    if sizes:
+        print(f"[{label}] 长度估算（字符启发式，真实值以 main.py 实测为准）: "
+              f"最长 {max(sizes)} / 平均 {sum(sizes) / len(sizes):.0f} tokens")
+
+
+def run_post_generation_checks(train_data, val_data, train_file, val_file, pool):
+    """生成后的端到端自检，返回问题列表（空 = 通过）。
+
+    刻意把刚写盘的文件**重新读回来**再校验一遍：这样能顺带发现序列化往返的问题
+    （编码、非法 JSON、字段丢失），而不只是检查内存里的对象。
+    """
+    print("=" * 64)
+    print("生成后自检（回读 train.jsonl / val.jsonl）")
+    print("=" * 64)
+
+    issues = []
+
+    reloaded_train = read_jsonl(train_file)
+    reloaded_val = read_jsonl(val_file)
+    if len(reloaded_train) != len(train_data):
+        issues.append(f"train.jsonl 回读条数不符: 内存 {len(train_data)} / 磁盘 {len(reloaded_train)}")
+    if len(reloaded_val) != len(val_data):
+        issues.append(f"val.jsonl 回读条数不符: 内存 {len(val_data)} / 磁盘 {len(reloaded_val)}")
+
+    issues += validate_structure(reloaded_train, "train")
+    issues += validate_structure(reloaded_val, "val")
+    issues += validate_tool_calls(reloaded_train, "train")
+    issues += validate_tool_calls(reloaded_val, "val")
+    issues += validate_group_consistency(pool)
+
+    rows = reloaded_train + reloaded_val
+    print(f"回读样本总数: {len(rows)}  (train {len(reloaded_train)} / val {len(reloaded_val)})")
+    summarize(reloaded_train, "train")
+    summarize(reloaded_val, "val")
+
+    print("\n" + "-" * 64)
+    if issues:
+        print(f"自检结果: 不通过，共 {len(issues)} 个问题")
+        for item in issues[:30]:
+            print("  -", item)
+        if len(issues) > 30:
+            print(f"  ... 另有 {len(issues) - 30} 个问题未展示")
+    else:
+        print("自检结果: 通过")
+    print("-" * 64)
+    return issues
+
+
+# ============================================================
+# 11. 入口
+# ============================================================
 
 def generate_dataset():
-    random.seed(42)
+    chain_pool = build_deploy_chain_samples()
+    login_pool = build_login_action_samples()
+    devops_pool = build_devops_action_samples()
+    qa_pool = build_qa_samples()
 
-    action_samples = build_multiturn_action_samples()
-    qa_samples = build_qa_samples()
+    print("原始生成:")
+    print(f"  - 部署流水线前缀展开 + 失败分支: {len(chain_pool)} 条 "
+          f"({len({gid for _, gid, _ in chain_pool})} 个轨迹组)")
+    print(f"  - 登录 Action 样本: {len(login_pool)} 条")
+    print(f"  - DevOps 单步动作样本: {len(devops_pool)} 条")
+    print(f"  - 知识库问答样本: {len(qa_pool)} 条")
 
-    print(f"原始生成: Action 样本 {len(action_samples)} 条, QA 样本 {len(qa_samples)} 条")
+    all_pool = chain_pool + login_pool + devops_pool + qa_pool
+    all_gids = {gid for _, gid, _ in all_pool}
+    train_data, val_data, train_gids, val_gids = split_by_group(all_pool)
 
-    random.shuffle(action_samples)
-    random.shuffle(qa_samples)
-
-    # 抽取高质量混合数据 (约 350 条样本)
-    selected_actions = action_samples[:220]
-    selected_qa = qa_samples[:130]
-
-    all_samples = selected_actions + selected_qa
-    random.shuffle(all_samples)
-
-    # 按照 85% : 15% 划分训练集和验证集
-    train_count = int(len(all_samples) * 0.85)
-    train_data = all_samples[:train_count]
-    val_data = all_samples[train_count:]
+    # 泄漏自检：同一个轨迹组绝不能同时落到 train 和 val
+    leak = train_gids & val_gids
+    if leak:
+        raise RuntimeError(f"检测到轨迹组跨集合泄漏，共 {len(leak)} 组：{sorted(leak)[:5]} ...")
 
     data_dir = Path(__file__).parent / "data"
     data_dir.mkdir(exist_ok=True)
@@ -536,16 +1327,36 @@ def generate_dataset():
         for item in val_data:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-    print("=" * 60)
-    print("原生 Multi-Turn Agent 复合数据集生成完成！")
-    print(f"总生成样本数: {len(all_samples)} 条")
-    print(f"  - Action 多轮与行动样本: {len(selected_actions)} 条")
-    print(f"  - 知识库问答 QA 样本: {len(selected_qa)} 条")
-    print(f"划分结果:")
-    print(f"  - 训练集 (train.jsonl): {len(train_data)} 条 -> {train_file}")
-    print(f"  - 验证集 (val.jsonl): {len(val_data)} 条 -> {val_file}")
-    print("=" * 60)
+    total = len(train_data) + len(val_data)
+    chain_ratio = len(chain_pool) / total * 100 if total else 0
+
+    print("=" * 64)
+    print("SAP BTP Multi-Turn Agent 前缀展开数据集生成完成")
+    print(f"总样本数: {total} 条 / 轨迹组: {len(all_gids)} 个")
+    print(f"  - 链式与失败样本: {len(chain_pool)} 条 (占比 {chain_ratio:.1f}%)")
+    print("划分结果（按轨迹组切分，已验证无泄漏）:")
+    print(f"  - 训练集 (train.jsonl): {len(train_data)} 条 / {len(train_gids)} 组")
+    print(f"  - 验证集 (val.jsonl)  : {len(val_data)} 条 / {len(val_gids)} 组")
+    print(f"输出目录: {data_dir}")
+    print("=" * 64)
+
+    print("\n[提醒] 工具层采用「固定任务 + 随机化外壳」策略：")
+    for p in TOOL_PROFILES:
+        print(f"        {p['id']:>18s}  权重 {p['weight']:<2d}  工具 {len(p['tools'])} 条"
+              f"  命令工具名 `{shell_tool_name(p)}`")
+    print("        改权重只需调整 TOOL_PROFILES 里的 weight。")
+    print("[提醒] 每步要执行的 shell 命令（Invoke-RestMethod / Copy-Item / mbt build / "
+          "cf deploy / Remove-Item）在所有档位里是恒定的 —— 那才是要学的技能。")
+    print("[提醒] CodeBuddy 的 execute_command 没有 timeout 参数，"
+          "超时要求靠助手旁白表达；Bash 档位则会带 timeout=600000（毫秒）。")
+
+    # ---- 生成完立刻自检一遍 ----
+    issues = run_post_generation_checks(train_data, val_data, train_file, val_file, all_pool)
+    return len(issues)
+
 
 if __name__ == "__main__":
-    generate_dataset()
-
+    problem_count = generate_dataset()
+    if problem_count:
+        raise SystemExit(f"生成后自检发现 {problem_count} 个问题，先修数据再拿去训练。")
+    print("\n下一步: python main.py  （训练前会再用 tokenizer 实测一次长度与 tools 渲染）")
