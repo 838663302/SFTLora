@@ -89,15 +89,15 @@ def make_sft_config():
         lr_scheduler_type="cosine",
         warmup_steps=10,
         max_grad_norm=1.0,
-        num_train_epochs=3,
-        logging_steps=10,
+        num_train_epochs=2,
+        logging_steps=10,            # 每 10 步往 TensorBoard 写一次
         eval_strategy = "steps",
         eval_steps=20,
         save_strategy="steps",
         save_steps=20,
         save_total_limit=2,
         load_best_model_at_end=True,
-        report_to="none",            # 不接 wandb，避免多进程重复上报
+        report_to="tensorboard",
         **extra_kwargs,
     )
 
@@ -152,9 +152,12 @@ def main():
 
     trainer.train()
 
+    # trainer.save_model 内部已按 args.should_save（仅 process_index==0）守住写盘，多进程下只会存一份；
+    # 但 tokenizer.save_pretrained 属于 PreTrainedTokenizerBase，完全没有分布式守卫，
+    # 两个进程会并发写同一个 tokenizer.json（十几 MB，可能写出半截导致损坏），必须自己挡。
     trainer.save_model(str(config.MODEL_PATH))
-    tokenizer.save_pretrained(str(config.MODEL_PATH))
     if is_main_process:
+        tokenizer.save_pretrained(str(config.MODEL_PATH))
         print(f"LoRA 权重与 Tokenizer 已保存至: {config.MODEL_PATH}")
 
 
