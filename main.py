@@ -102,7 +102,45 @@ def make_sft_config():
     )
 
 
+def patch_peft_tensor_parallel_compat():
+    """兼容 peft 与 transformers>=5.16 的 ImportError（张量并行分片）。
+
+    transformers 5.16 起把 `transformers.integrations.tensor_parallel` 改成指向
+    `transformers.distributed.tensor_parallel` 的兼容 shim，且不再重导出 `EmbeddingParallel`。
+    而 peft 的 `_maybe_shard_state_dict_for_tp` 在函数开头**无条件** import 该类，于是即使
+    完全不使用张量并行（本训练是单机 DDP），`_load_best_model -> load_adapter ->
+    set_peft_model_state_dict` 也会直接 ImportError（peft issue #3628，官方暂无补丁）。
+
+    本训练模型不含 `_hf_tp_plan`（非 TP），TP 分片本就无事可做：检测到该 ImportError 时
+    对非 TP 模型直接跳过；真 TP 模型仍原样抛错，避免调换语义后悄悄存出错误的权重。
+    """
+    try:
+        from peft.utils import save_and_load
+    except Exception:  # peft 结构变化时静默跳过，不阻断训练
+        return
+
+    original = getattr(save_and_load, "_maybe_shard_state_dict_for_tp", None)
+    if original is None:  # 旧版 peft 无此函数，或已被上游修复删除，无需兼容
+        return
+
+    def has_tp_plan(model) -> bool:
+        return any(getattr(module, "_hf_tp_plan", None) is not None for module in model.modules())
+
+    def safe_maybe_shard_state_dict_for_tp(model, state_dict, adapter_name):
+        try:
+            return original(model, state_dict, adapter_name)
+        except ImportError as exc:
+            if has_tp_plan(model):
+                raise
+            print(f"[兼容] 跳过 peft 张量并行分片（当前模型非 TP）：{exc}")
+            return None
+
+    save_and_load._maybe_shard_state_dict_for_tp = safe_maybe_shard_state_dict_for_tp
+
+
 def main():
+    patch_peft_tensor_parallel_compat()
+
     # 只在主进程做长度自检与日志打印，否则两个 rank 会把 809 条样本各 tokenize 一遍
     is_main_process = int(os.environ.get("LOCAL_RANK", 0)) == 0
 
