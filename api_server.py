@@ -65,24 +65,68 @@ def load_model(device: str = "GPU"):
     print(f"\n>>> 模型已就绪！成功运行在: [{current_device}] <<<\n")
 
 
+def robust_parse_tool_call(m: str):
+    """容错解析可能带有未转义引号的脏 JSON 工具调用"""
+    try:
+        call_json = json.loads(m.strip())
+        return call_json.get("name", ""), call_json.get("arguments", {})
+    except Exception:
+        pass
+
+    # 正则提取 name
+    name_match = re.search(r'"name"\s*:\s*"([^"]+)"', m)
+    tool_name = name_match.group(1) if name_match else ""
+
+    # 特别针对 execute_command 的命令字符串修复（解决 powershell 引号嵌套冲突）
+    if tool_name == "execute_command":
+        cmd_match = re.search(r'"command"\s*:\s*"(.*?)"\s*,\s*"requires_approval"', m, re.DOTALL)
+        if not cmd_match:
+            cmd_match = re.search(r'"command"\s*:\s*"(.*)"\s*\}', m, re.DOTALL)
+        appr_match = re.search(r'"requires_approval"\s*:\s*(true|false)', m, re.IGNORECASE)
+        requires_approval = appr_match.group(1).lower() == 'true' if appr_match else True
+        if cmd_match:
+            cmd_text = cmd_match.group(1)
+            return tool_name, {"command": cmd_text, "requires_approval": requires_approval}
+
+    # 特别针对 write_to_file 的长文本内容提取
+    if tool_name == "write_to_file":
+        fp_match = re.search(r'"filePath"\s*:\s*"([^"]+)"', m)
+        content_match = re.search(r'"content"\s*:\s*"(.*?)"\s*(?:\}\s*\}|\}\s*$|$)', m, re.DOTALL)
+        if fp_match:
+            c_val = content_match.group(1) if content_match else ""
+            return tool_name, {"filePath": fp_match.group(1), "content": c_val}
+
+    # 通用 arguments 提取
+    args_match = re.search(r'"arguments"\s*:\s*(\{.*\})', m, re.DOTALL)
+    if args_match:
+        try:
+            return tool_name, json.loads(args_match.group(1))
+        except Exception:
+            return tool_name, {"raw_arguments": args_match.group(1)}
+
+    return tool_name, {}
+
+
 def parse_tool_calls(text: str):
     """解析 Qwen 文本中的 <tool_call> 标签并转化为 OpenAI 标准 tool_calls 结构"""
     tool_calls = []
     # 移除 think 标签
     text_clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
-    pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
+    # 兼容闭合或未完全闭合的 <tool_call>
+    pattern = r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)"
     matches = re.findall(pattern, text_clean, re.DOTALL)
-    clean_content = re.sub(pattern, "", text_clean, flags=re.DOTALL).strip()
+    clean_content = re.sub(r"<tool_call>.*", "", text_clean, flags=re.DOTALL).strip()
 
     for idx, m in enumerate(matches):
-        try:
-            call_json = json.loads(m.strip())
-            tool_name = call_json.get("name", "")
-            args = call_json.get("arguments", {})
+        m_str = m.strip()
+        if not m_str:
+            continue
+        tool_name, args = robust_parse_tool_call(m_str)
+        if tool_name:
             args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
             tool_calls.append({
-                "index": idx,
+                "index": len(tool_calls),
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
                 "function": {
@@ -90,8 +134,8 @@ def parse_tool_calls(text: str):
                     "arguments": args_str
                 }
             })
-        except Exception as e:
-            print(f"[ToolCall Parse Error]: {e} on raw content: {m}")
+        else:
+            print(f"[ToolCall Parse Failed]: {m_str[:120]}...")
 
     for stop in ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]:
         clean_content = clean_content.replace(stop, "").strip()
@@ -179,6 +223,21 @@ async def chat_completions(req: ChatRequest):
                 tool_names.append(str(t))
         print(f"👉 包含工具列表 ({tool_count} 个): {tool_names}")
 
+    CORE_TOOL_NAMES = {"list_dir", "search_file", "search_content", "read_file", "write_to_file", "execute_command", "delete_file", "ask_followup_question"}
+    filtered_tools = req.tools
+    if req.tools and len(req.tools) > 10:
+        cleaned = []
+        for t in req.tools:
+            name = ""
+            if isinstance(t, dict):
+                fn = t.get("function", {})
+                name = fn.get("name") or t.get("name", "")
+            if name in CORE_TOOL_NAMES:
+                cleaned.append(t)
+        if cleaned:
+            print(f"🧹 [CodeBuddy 工具清洗]: 将 {len(req.tools)} 个工具过滤精简为 {len(cleaned)} 个核心工具")
+            filtered_tools = cleaned
+
     msgs = []
     for m in req.messages:
         item = {"role": m.role, "content": m.content if m.content is not None else ""}
@@ -190,26 +249,28 @@ async def chat_completions(req: ChatRequest):
             item["name"] = m.name
         msgs.append(item)
 
-    # 渲染模版
+    # 渲染模版 (添加 enable_thinking=False 对齐训练集)
     try:
         text = tokenizer.apply_chat_template(
             conversation=msgs,
-            tools=req.tools if req.tools else None,
+            tools=filtered_tools if filtered_tools else None,
             tokenize=False,
-            add_generation_prompt=True
+            add_generation_prompt=True,
+            enable_thinking=False
         )
     except Exception as e:
         print(f"[apply_chat_template Error]: {e}, fallback without tools template")
         text = tokenizer.apply_chat_template(
             conversation=msgs,
             tokenize=False,
-            add_generation_prompt=True
+            add_generation_prompt=True,
+            enable_thinking=False
         )
 
     inputs = tokenizer(text, return_tensors="pt")
     created_time = int(time.time())
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    max_tokens = req.max_tokens or 512
+    max_tokens = max(req.max_tokens or 512, 2048)
 
     # 执行推理 (加锁保证线程安全)
     async with generate_lock:
@@ -230,8 +291,29 @@ async def chat_completions(req: ChatRequest):
     if req.stream:
         async def event_generator():
             if tool_calls:
-                # 针对工具调用的标准 OpenAI 流式 Chunk
-                chunk = {
+                # 针对 CodeBuddy: 若包含说明文字，先流式推送文本
+                if clean_content:
+                    txt_chunk = {
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": req.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": clean_content
+                                },
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(txt_chunk, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.01)
+
+                # 再推送标准 OpenAI tool_calls chunk
+                tc_chunk = {
                     "id": req_id,
                     "object": "chat.completion.chunk",
                     "created": created_time,
@@ -240,15 +322,14 @@ async def chat_completions(req: ChatRequest):
                         {
                             "index": 0,
                             "delta": {
-                                "role": "assistant",
-                                "content": clean_content if clean_content else None,
+                                "role": "assistant" if not clean_content else None,
                                 "tool_calls": tool_calls
                             },
                             "finish_reason": None
                         }
                     ]
                 }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps(tc_chunk, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0.01)
 
                 final_chunk = {

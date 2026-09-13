@@ -590,7 +590,6 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
     mtar_log, mtar_full, mta_root, need_join = make_chain_mtar(rule)
 
     mta_src, mta_candidates = locate_mta(rule)
-    mta_content = make_mta_content(proj)
 
     def shell_call(content, command, requires_approval, short_desc, is_long_running=False):
         args = build_arguments(profile, command, short_desc, requires_approval, is_long_running)
@@ -617,8 +616,8 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
         },
     ]
 
-    # ---- 「找到对应 mta 文件并复制内容为根目录 mta.yaml」按档位展开 ----
-    # CodeBuddy 档位带文件工具 -> 查找(search_file) / 读取(read_file) / 写入(write_to_file)；
+    # ---- 「找到对应 mta 文件并复制为根目录 mta.yaml」按档位展开 ----
+    # CodeBuddy 档位 -> 先用 search_file 定位文件，再用 execute_command 执行 Copy-Item 复制；
     # 只有 shell 的档位 -> 一条「递归查找 + 复制」命令。
     if profile["id"] == "codebuddy":
         steps.append({
@@ -633,22 +632,15 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
         })
         steps.append({
             "key": "copy",
-            "pre": make_call(
-                f"已定位到匹配文件 `{mta_src}`，读取它的完整内容：",
-                "read_file", {"filePath": mta_src}),
-            "ok": mta_content,
-            "fail": "",
-            "label": "读取 MTA 文件",
-        })
-        steps.append({
-            "key": "copy",
-            "pre": make_call(
-                f"将 `{mta_src}` 的完整内容写入项目根目录的 `mta.yaml`"
+            "pre": shell_call(
+                f"已定位到匹配文件 `{mta_src}`，将其复制为根目录下的 `mta.yaml`"
                 "（不存在就新建，已存在就覆盖）：",
-                "write_to_file", {"filePath": "mta.yaml", "content": mta_content}),
-            "ok": "The file mta.yaml has been written successfully.",
-            "fail": "",
-            "label": "写入 mta.yaml",
+                f"Copy-Item {mta_src} mta.yaml -Force",
+                False,
+                "复制 MTA 配置文件为 mta.yaml"),
+            "ok": "",
+            "fail": f"Copy-Item : Cannot find path '{mta_src}' because it does not exist.",
+            "label": "复制 MTA 文件",
         })
     else:
         copy_cmd = (f"$f=(Get-ChildItem -Path . -Recurse -File -Filter {mta} "
@@ -723,7 +715,7 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
                 f"✅ **SAP BTP 构建与部署全流程已完成**\n\n"
                 f"- **目标环境**：{ws} 工作区 / {proj} 项目 / {env_disp}\n"
                 f"- **空间登录**：已登录 space code `{code}`\n"
-                f"- **配置同步**：`{mta_src}` 的完整内容已写入根目录 `mta.yaml`\n"
+                f"- **配置同步**：`{mta_src}` 已复制为根目录 `mta.yaml`\n"
                 f"- **MTA 构建**：`mbt build` 已生成，归档完整路径 `{mtar_full}`\n"
                 f"- **CF 部署**：`cf deploy` 执行成功，应用已启动\n"
                 f"- **环境清理**：临时 `mta.yaml` 与构建产物已删除，项目目录已恢复干净状态"
@@ -921,10 +913,10 @@ def build_login_action_samples():
 # 7. 单步原子动作样本（复制 / 构建 / 部署 / 清理）
 # ============================================================
 
-def _copy_action_calls(profile, rule, env_str, mta_src, mta_candidates, mta_content, action):
+def _copy_action_calls(profile, rule, env_str, mta_src, mta_candidates, action):
     """把「找到 mta 文件并复制内容为根目录 mta.yaml」按档位展开成具体工具调用序列。
 
-    CodeBuddy 档位用文件工具：search_file 定位 -> read_file 读内容 -> write_to_file 写 mta.yaml；
+    CodeBuddy 档位：search_file 定位 -> shell 执行 Copy-Item 复制；
     只有 shell 的档位用一条「递归查找 + 复制」命令。
 
     返回 [(pre_content, tool, payload, tool_result), ...]；tool="shell" 时 payload 为
@@ -935,11 +927,10 @@ def _copy_action_calls(profile, rule, env_str, mta_src, mta_candidates, mta_cont
             (f"正在查找与 {env_str} 匹配的 MTA 配置文件：", "search_file",
              {"target_directory": ".", "pattern": "mta*.yaml", "recursive": True},
              json.dumps(mta_candidates, ensure_ascii=False)),
-            (f"已定位到 `{mta_src}`，读取它的完整内容：", "read_file",
-             {"filePath": mta_src}, mta_content),
-            (f"将 `{mta_src}` 的完整内容写入根目录 `mta.yaml`：", "write_to_file",
-             {"filePath": "mta.yaml", "content": mta_content},
-             "The file mta.yaml has been written successfully."),
+            (f"已定位到 `{mta_src}`，将其复制为根目录下的 `mta.yaml`（不存在就新建，已存在就覆盖）：",
+             "shell",
+             (f"Copy-Item {mta_src} mta.yaml -Force", False, "复制 MTA 配置文件为 mta.yaml", False),
+             ""),
         ]
     copy_cmd = (f"$f=(Get-ChildItem -Path . -Recurse -File -Filter {rule['mta']} "
                 "| Select-Object -First 1).FullName; Copy-Item $f -Destination mta.yaml -Force")
@@ -959,7 +950,6 @@ def build_devops_action_samples():
         mtar_path = make_mtar_path(proj)
 
         mta_src, mta_candidates = locate_mta(rule)
-        mta_content = make_mta_content(proj)
 
         actions = []
 
@@ -1029,8 +1019,8 @@ def build_devops_action_samples():
 
             if action["kind"] == "copy":
                 calls = _copy_action_calls(profile, rule, env_str, mta_src,
-                                           mta_candidates, mta_content, action)
-                final_text = (f"`{mta_src}` 的完整内容已写入根目录 `mta.yaml`。"
+                                           mta_candidates, action)
+                final_text = (f"`{mta_src}` 已成功复制为根目录 `mta.yaml`。"
                               if profile["id"] == "codebuddy" else action["final_shell"])
             else:
                 calls = [(action["pre"], "shell",
@@ -1449,7 +1439,7 @@ def generate_dataset():
     print("        改权重只需调整 TOOL_PROFILES 里的 weight。")
     print("[提醒] 每步要执行的命令（Invoke-RestMethod / 查找并复制 mta / mbt build / "
           "cf deploy / Remove-Item）在所有档位里是恒定的 —— 那才是要学的技能。")
-    print("[提醒] 「复制 mta」按档位展开：CodeBuddy 用 search_file -> read_file -> write_to_file，"
+    print("[提醒] 「复制 mta」按档位展开：CodeBuddy 用 search_file 定位 -> execute_command 执行 Copy-Item，"
           "其余档位用一条 Get-ChildItem 递归查找 + Copy-Item 命令（mta 文件可能在 mta/ 子目录）。")
     print("[提醒] CodeBuddy 的 execute_command 没有 timeout 参数，"
           "超时要求靠助手旁白表达；Bash 档位则会带 timeout=600000（毫秒）。")

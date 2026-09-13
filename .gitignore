@@ -217,3 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .vscode
+run_agent_pipeline.py
+test_dirty_json.py
+test_prompt.py
+test_turn4.py
