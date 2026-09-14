@@ -218,7 +218,6 @@ def main():
         lora_dropout=0.1,
         bias="none",
         task_type="CAUSAL_LM",
-        autocast_adapter_dtype=False,  # 别把 LoRA 权重对齐成 fp16/bf16：fp16 AMP 下非 fp32 的可训练参数会让 GradScaler 直接崩
         target_modules=[
             "q_proj",
             "k_proj",
