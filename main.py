@@ -12,10 +12,10 @@ import torch
 import transformers
 import trl
 import config
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import SFTConfig, SFTTrainer
 from process import process
-from peft import LoraConfig
+from peft import LoraConfig, prepare_model_for_kbit_training
 
 # 单条样本的最大 token 数。
 # 实测数据集中全量最长样本仅 3390 token（均值约 2082 token）。
@@ -69,6 +69,25 @@ def check_max_length(train_dataset, tokenizer, max_length):
     print(f"[数据自检] 长度检查通过，余量 {max_length - overall_length} tokens")
 
 
+def check_precision(model):
+    """训练前自检：打印模型与可训练参数的 dtype，提前拦住「fp16 AMP 撞 bf16 权重」这类必崩组合。
+
+    PyTorch 的 GradScaler 只认识 fp32/fp16 梯度：只要有一个可训练参数是 bf16，
+    `unscale_` 就会直接抛
+    `NotImplementedError: _amp_foreach_non_finite_check_and_unscale_cuda not implemented for 'BFloat16'`。
+    """
+    print("=" * 64)
+    all_dtypes = sorted({str(p.dtype) for p in model.parameters()})
+    trainable = [(name, param.dtype) for name, param in model.named_parameters() if param.requires_grad]
+    print(f"[精度自检] 模型参数 dtype: {all_dtypes}")
+    print(f"[精度自检] 可训练参数 {len(trainable)} 个，dtype: {sorted({str(d) for _, d in trainable})}")
+
+    risky = [name for name, dtype in trainable if dtype in (torch.float16, torch.bfloat16)]
+    if risky:
+        print(f"[精度自检][警告] 以下可训练参数不是 fp32，与 fp16 AMP 的 GradScaler 冲突: {risky[:5]}"
+              f"{' ...' if len(risky) > 5 else ''}")
+
+
 def make_sft_config():
     """按当前 TRL 版本支持的字段名构造 SFTConfig（max_length / max_seq_length 兼容）。"""
     supported = set(inspect.signature(SFTConfig.__init__).parameters)
@@ -91,6 +110,7 @@ def make_sft_config():
         ddp_find_unused_parameters=False,                       # 核心修复 2：DDP 显式关闭未用参数查找，杜绝 flow control 报错与额外显存缓冲
         learning_rate=1.5e-4,        # 4B 模型 LoRA 调优为 1.5e-4，平滑梯度收敛
         fp16=True,                   # T4(Turing) 不支持 bf16，继续用 fp16 + GradScaler
+        bf16=False,                  # 显式关闭：与上面的 fp16 互斥，避免被环境/版本差异悄悄打开
         optim="paged_adamw_8bit" if torch.cuda.is_available() else "adamw_torch",
         lr_scheduler_type="cosine",
         warmup_steps=10,
@@ -164,54 +184,31 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device_map = {"": local_rank} if torch.cuda.is_available() else None
 
-    model_kwargs: dict[str, Any] = {
-        "torch_dtype": torch.float16,
-        "attn_implementation": "sdpa",
-    }
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
 
-    # 默认启用 4-bit QLoRA 模式（彻底解决 15GB T4 GPU 下的 OOM 问题）
-    # 4-bit NF4 量化后 4B 基座显存从 ~8GB 压降至 ~2.2GB，留足 10GB+ 显存余量供反向传播
-    use_4bit = os.environ.get("USE_4BIT", "1").lower() in ("1", "true", "yes")
-    if use_4bit:
-        try:
-            from transformers import BitsAndBytesConfig
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-            if device_map is not None:
-                model_kwargs["device_map"] = device_map
-            if is_main_process:
-                print(f"[量化] 已默认启用 4-bit QLoRA 模式，基座显存压降至 ~2.2GB (device_map={device_map})")
-        except ImportError:
-            if is_main_process:
-                print("[警告] 未检测到 bitsandbytes，回退至 FP16 模式")
+    # dtype 必须写对：名字写错会被 from_pretrained 当无关 kwargs 丢掉且不报错，
+    # 模型就会按 checkpoint 自带的 bf16 加载，随后 GradScaler 在首次梯度裁剪时抛
+    # `_amp_foreach_non_finite_check_and_unscale_cuda not implemented for 'BFloat16'`。
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=bnb_config,
+        device_map=device_map,
+        dtype=torch.float16,
+        attn_implementation="sdpa",
+    )
 
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            **model_kwargs,
-        )
-    except Exception as exc:
-        print(f"[提示] AutoModelForCausalLM 加载异常，尝试 AutoModelForImageTextToText: {exc}")
-        from transformers import AutoModelForImageTextToText
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_name,
-            **model_kwargs,
-        )
-
-    # 显式关闭 KV cache：训练时开启梯度检查点必须关闭 use_cache，防止反向传播警告与显存泄漏
     model.config.use_cache = False
 
-    if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
-        from peft import prepare_model_for_kbit_training
-        model = prepare_model_for_kbit_training(
-            model,
-            use_gradient_checkpointing=True,
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-        )
+    model = prepare_model_for_kbit_training(
+        model,
+        use_gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+    )
 
     sft_config = make_sft_config()
 
@@ -221,6 +218,7 @@ def main():
         lora_dropout=0.1,
         bias="none",
         task_type="CAUSAL_LM",
+        autocast_adapter_dtype=False,  # 别把 LoRA 权重对齐成 fp16/bf16：fp16 AMP 下非 fp32 的可训练参数会让 GradScaler 直接崩
         target_modules=[
             "q_proj",
             "k_proj",
@@ -240,6 +238,11 @@ def main():
         eval_dataset=data_dict["val"],
         processing_class = tokenizer,
     )
+
+    # 必须在 Trainer 挂好 LoRA 之后再看：PeftModel 一旦把适配器转成 fp16/bf16，
+    # fp16 AMP 的 GradScaler 就会在第一次梯度裁剪时崩掉，这里提前把 dtype 打出来。
+    if is_main_process:
+        check_precision(trainer.model)
 
     trainer.train()
 
