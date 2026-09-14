@@ -2,6 +2,9 @@ import inspect
 import os
 from typing import Any
 
+# 必须在 import torch 之前设置，启用虚拟内存段扩展，彻底解决显存碎片导致的 OOM
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 if "LOCAL_RANK" not in os.environ:
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
@@ -15,10 +18,9 @@ from process import process
 from peft import LoraConfig
 
 # 单条样本的最大 token 数。
-# 推理时 agent 会把整套工具定义塞进 prompt（CodeBuddy 档位是 9 条工具，约 1800 token），
-# 链式样本还有完整 SOP + 5 步工具调用 + 最终汇报，实测最长约 3650 token、平均约 2200 token。
-# TRL 的 SFTConfig 默认 max_length 只有 1024，会把最关键的收尾部分截掉，必须显式放大。
-MAX_LENGTH = 8192
+# 实测数据集中全量最长样本仅 3390 token（均值约 2082 token）。
+# 设置为 3840 即可留足约 450 token 安全余量，避免盲目设为 8192 浪费多余的注意力和位置张量显存。
+MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "3840"))
 
 
 def check_max_length(train_dataset, tokenizer, max_length):
@@ -85,6 +87,8 @@ def make_sft_config():
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=4,
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},  # 核心修复 1：非重入 checkpointing，反向传播显存及时释放且杜绝 DDP 警告
+        ddp_find_unused_parameters=False,                       # 核心修复 2：DDP 显式关闭未用参数查找，杜绝 flow control 报错与额外显存缓冲
         learning_rate=1.5e-4,        # 4B 模型 LoRA 调优为 1.5e-4，平滑梯度收敛
         fp16=True,                   # T4(Turing) 不支持 bf16，继续用 fp16 + GradScaler
         lr_scheduler_type="cosine",
@@ -156,18 +160,48 @@ def main():
         print(f"训练集 {len(data_dict['train'])} 条 / 验证集 {len(data_dict['val'])} 条")
         check_max_length(data_dict["train"], tokenizer, MAX_LENGTH)
 
+    model_kwargs: dict[str, Any] = {
+        "torch_dtype": torch.float16,
+        "attn_implementation": "sdpa",
+    }
+
+    # 支持可选的 4-bit QLoRA 模式：在显存极度紧张的 15GB T4 GPU 下，
+    # 开启环境变量 USE_4BIT=1 可将 4B 基座显存从 ~8GB 压至 ~2.4GB
+    use_4bit = os.environ.get("USE_4BIT", "0").lower() in ("1", "true", "yes")
+    if use_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+            if is_main_process:
+                print("[量化] 已启用 4-bit QLoRA 模式，基座模型显存将从 ~8GB 降至 ~2.4GB")
+        except ImportError:
+            if is_main_process:
+                print("[警告] 未安装 bitsandbytes，回退至 FP16 模式")
+
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            dtype=torch.float16,
+            **model_kwargs,
         )
     except Exception as exc:
         print(f"[提示] AutoModelForCausalLM 加载异常，尝试 AutoModelForImageTextToText: {exc}")
         from transformers import AutoModelForImageTextToText
         model = AutoModelForImageTextToText.from_pretrained(
             model_name,
-            dtype=torch.float16,
+            **model_kwargs,
         )
+
+    # 显式关闭 KV cache：训练时开启梯度检查点必须关闭 use_cache，防止反向传播警告与显存泄漏
+    model.config.use_cache = False
+
+    if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
+        from peft import prepare_model_for_kbit_training
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
     sft_config = make_sft_config()
 
