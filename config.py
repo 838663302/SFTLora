@@ -17,3 +17,6 @@ else:
 MODEL_PATH = WORKING_PATH / "checkpoints" / "final"
 CHECKPOINTS = WORKING_PATH / "checkpoints"
 MERGED_PATH = WORKING_PATH / "checkpoints" / "merged"
+
+# 基础模型配置：选用纯文本因果语言模型 Qwen3-4B
+BASE_MODEL_NAME = os.environ.get("BASE_MODEL_NAME", "Qwen/Qwen3-4B")

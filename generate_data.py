@@ -31,7 +31,7 @@ SEED = 42
 #   ~/.codebuddy/agents/btp-deploy.md
 #     → agent 暴露 9 条工具（去掉没有 schema 可查的 read_rules）
 
-FAIL_BRANCHES_PER_TRAJECTORY = 2
+FAIL_BRANCHES_PER_TRAJECTORY = 3
 # 采样重复：规则少了之后（14 -> 3），靠重复把「登录 code / mta 文件」映射的曝光量补回来。
 # 基础每条规则 2 轮；歧义规则（code 历史上跨工作区复用）3 轮。
 BASE_REPEAT = 2
@@ -356,6 +356,45 @@ def make_result(call_message, content, tool=None):
     }
 
 
+def wrap_tool_result(profile, tool_name, content, is_error=False):
+    """根据 agent 档位，对 shell 工具的输出做环境真实感包装。
+
+    在真实 CodeBuddy 环境中，execute_command 的返回往往带有 JSON 外壳：
+      - 成功：{"status":"success","success":true,"result":{"type":"execute_command_result","stdout":...,"stderr":"","exitCode":0}}
+      - 失败：{"status":"error","success":false,"result":{"type":"execute_command_result","stdout":...,"stderr":"","exitCode":1}}
+    
+    60% 概率添加 CodeBuddy JSON 外壳，40% 保持原始文本，使模型同时适应结构化返回与原始终端输出。
+    """
+    if not content:
+        return ""
+    if profile.get("id") == "codebuddy" and tool_name == "execute_command":
+        if rng.random() < 0.6:
+            if is_error:
+                envelope = {
+                    "status": "error",
+                    "success": False,
+                    "result": {
+                        "type": "execute_command_result",
+                        "stdout": content,
+                        "stderr": "",
+                        "exitCode": 1,
+                    },
+                }
+            else:
+                envelope = {
+                    "status": "success",
+                    "success": True,
+                    "result": {
+                        "type": "execute_command_result",
+                        "stdout": content,
+                        "stderr": "",
+                        "exitCode": 0,
+                    },
+                }
+            return json.dumps(envelope, ensure_ascii=False)
+    return content
+
+
 def make_mta_content(project):
     """构造一段真实感的 mta.yaml 内容，用于演示「读取源文件内容 -> 写入根目录 mta.yaml」。"""
     return (
@@ -595,6 +634,56 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
         args = build_arguments(profile, command, short_desc, requires_approval, is_long_running)
         return make_call(content, tool_name, args)
 
+    # 丰富且真实的报错候选（覆盖真实环境中的各类异常：HTTP、PowerShell 语法错误、CLI 退出码异常等）
+    login_fail_choice = rng.choice([
+        ("Invoke-RestMethod : The remote server returned an error: (401) Unauthorized.\r\n"
+         f"login failed for space '{code}'"),
+        (f"Invoke-RestMethod : {{\"code\":500,\"data\":\"error\",\"message\":\"Internal Server Error: space '{code}' not registered\"}}\r\n"
+         "At line:1 char:1\r\n"
+         "+ Invoke-RestMethod -Uri http://localhost:3000/space/login -Method Post ...\r\n"
+         "+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n"
+         "    + CategoryInfo          : InvalidOperation: (System.Net.HttpWebRequest:HttpWebRequest) [Invoke-RestMethod], WebException\r\n"
+         "    + FullyQualifiedErrorId : WebCmdletWebResponseException,Microsoft.PowerShell.Commands.InvokeRestMethodCommand"),
+        ("Invoke-RestMethod : 无法连接到远程服务器 http://localhost:3000/space/login\r\n"
+         "Connect-Failure: No connection could be made because the target machine actively refused it 127.0.0.1:3000"),
+    ])
+
+    build_fail_choice = rng.choice([
+        # 1. 真实用户遇到的 PowerShell 管道与重定向语法解析错误（ParserError）
+        ("At C:\\Users\\azt1szh\\AppData\\Local\\Temp\\genie-ps-1789353580462-mxbplr.ps1:813 char:13\r\n"
+         "+ mbt build 2>&| > tmp.log\r\n"
+         "+             ~\r\n"
+         "Missing file specification after redirection operator.\r\n"
+         "The ampersand (&) character is not allowed. The & operator is reserved for future use; wrap an ampersand in double quotation marks (\"&\") to pass it as part of a string.\r\n"
+         "    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException\r\n"
+         "    + FullyQualifiedErrorId : MissingFileSpecification"),
+        # 2. mbt build 校验与构建失败
+        ("[INFO] validating the MTA project\r\n"
+         "[ERROR] the MTA project is not valid\r\n"
+         "[ERROR] could not find mta.yaml in current directory or syntax error\r\n"
+         "[ERROR] build failed, no archive was generated"),
+        # 3. 超时或异常终止
+        ("mbt build : The process was terminated because the timeout period elapsed.\r\n"
+         "[ERROR] execution timed out (600s), build aborted\r\n"
+         "Process exited with code -1"),
+    ])
+
+    deploy_fail_choice = rng.choice([
+        # 1. 真实用户遇到的 MTA 文件未找到（模型若幻觉文件名，真实环境直接报此错）
+        (f"FAILED\r\n"
+         f"Error retrieving MTA: Could not find MTA {mtar_full}\r\n"
+         f"Tip: use 'cf deploy -h' for more info."),
+        # 2. 应用启动失败
+        (f"Deploying multi-target app archive {mtar_full} in org my-org / space {code}...\r\n"
+         "Uploading application...\r\n"
+         "[ERROR] Deployment failed: application crashed or failed to start (exit code 1)"),
+        # 3. 502 / 网关错误
+        (f"Deploying multi-target app archive {mtar_full}...\r\n"
+         "Error: Service broker failed to provision service: 502 Bad Gateway\r\n"
+         "CF-ServiceBrokerBadResponse(10001): Service broker failed to provision\r\n"
+         "[ERROR] Deployment failed"),
+    ])
+
     # 每个 step 形如 dict(key, pre, ok, fail, label)。
     # 中间轮措辞统一为「状态 + 下一步动作 + 冒号」，禁止完成态措辞，
     # 把「全部完成 / 已就绪」这类收尾语气全部留给 success summary。
@@ -609,9 +698,8 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
                 True,
                 "登录 BTP 空间",
             ),
-            "ok": json.dumps({"code": 200, "data": "success", "message": "success"}, ensure_ascii=False),
-            "fail": ("Invoke-RestMethod : The remote server returned an error: (401) Unauthorized.\r\n"
-                     f"login failed for space '{code}'"),
+            "ok": wrap_tool_result(profile, tool_name, json.dumps({"code": 200, "data": "success", "message": "success"}, ensure_ascii=False), False),
+            "fail": wrap_tool_result(profile, tool_name, login_fail_choice, True),
             "label": "空间登录",
         },
     ]
@@ -638,8 +726,8 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
                 f"Copy-Item {mta_src} mta.yaml -Force",
                 False,
                 "复制 MTA 配置文件为 mta.yaml"),
-            "ok": "",
-            "fail": f"Copy-Item : Cannot find path '{mta_src}' because it does not exist.",
+            "ok": wrap_tool_result(profile, tool_name, "", False),
+            "fail": wrap_tool_result(profile, tool_name, f"Copy-Item : Cannot find path '{mta_src}' because it does not exist.", True),
             "label": "复制 MTA 文件",
         })
     else:
@@ -651,8 +739,8 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
                 f"空间 `{code}` 已登录。接下来在项目中查找与 {env_disp} 匹配的 MTA 配置文件 `{mta}`，"
                 f"并把它复制为根目录下的 `mta.yaml`（不存在就新建，已存在就覆盖）：",
                 copy_cmd, False, "查找并复制 MTA 配置为 mta.yaml"),
-            "ok": "",
-            "fail": f"Copy-Item : Cannot find path '{mta}' because it does not exist.",
+            "ok": wrap_tool_result(profile, tool_name, "", False),
+            "fail": wrap_tool_result(profile, tool_name, f"Copy-Item : Cannot find path '{mta}' because it does not exist.", True),
             "label": "MTA 文件复制",
         })
 
@@ -662,10 +750,8 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
             "`mta.yaml` 已就绪。接下来在项目根目录执行 `mbt build` 打包构建"
             "（超时 600 秒，非交互模式，需等待命令完整返回）：",
             "mbt build 2>&1 | Select-Object -Last 10", False, "构建 MTA 项目", True),
-        "ok": make_build_log(mtar_log),
-        "fail": ("[INFO] validating the MTA project\n"
-                 "[ERROR] the MTA project is not valid\n"
-                 "[ERROR] build failed, no archive was generated"),
+        "ok": wrap_tool_result(profile, tool_name, make_build_log(mtar_log), False),
+        "fail": wrap_tool_result(profile, tool_name, build_fail_choice, True),
         "label": "项目构建（mbt build）",
     })
 
@@ -687,11 +773,10 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
         "pre": shell_call(
             deploy_intro,
             f"cf deploy {mtar_full} -f", True, "部署 MTAR 归档到 BTP", True),
-        "ok": (f"Deploying multi-target app archive {mtar_full} in org my-org / space {code}...\r\n"
+        "ok": wrap_tool_result(profile, tool_name, (f"Deploying multi-target app archive {mtar_full} in org my-org / space {code}...\r\n"
                "Application started\r\n"
-               "Process finished."),
-        "fail": (f"Deploying multi-target app archive {mtar_full}...\r\n"
-                 "[ERROR] Deployment failed: application did not start"),
+               "Process finished."), False),
+        "fail": wrap_tool_result(profile, tool_name, deploy_fail_choice, True),
         "label": "CF 部署（cf deploy）",
     })
 
@@ -703,7 +788,7 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
             ("Remove-Item -Path mta.yaml, mta_archives, .mta_build_tmp "
              "-Recurse -Force -ErrorAction SilentlyContinue"),
             True, "清理临时构建产物"),
-        "ok": "",
+        "ok": wrap_tool_result(profile, tool_name, "", False),
         "fail": "",
         "label": "环境清理",
     })
@@ -886,10 +971,31 @@ def build_login_action_samples():
                         "id": call_id, "type": "function",
                         "function": {"name": tool_name, "arguments": login_args},
                     }]},
-                    {"role": "tool", "name": tool_name, "tool_call_id": call_id, "content": tool_res},
+                    {"role": "tool", "name": tool_name, "tool_call_id": call_id, "content": wrap_tool_result(profile, tool_name, tool_res, False)},
                     {"role": "assistant", "content": final_success},
                 ],
             }))
+
+            # 增加登录失败分支样本：让模型在单点动作中也学会根据返回结果判断成功/失败
+            if index % 2 == 0:
+                login_fail_str = rng.choice([
+                    f"Invoke-RestMethod : The remote server returned an error: (401) Unauthorized.\r\nlogin failed for space '{code}'",
+                    f"Invoke-RestMethod : {{\"code\":500,\"data\":\"error\",\"message\":\"Internal Server Error: space '{code}' not found\"}}",
+                ])
+                pool.append((key, group_id + "|fail", {
+                    "tools": tools_list,
+                    "messages": [
+                        {"role": "system", "content": pick_system_prompt(profile)},
+                        {"role": "user", "content": user_text},
+                        {"role": "assistant", "content": "", "tool_calls": [{
+                            "id": call_id, "type": "function",
+                            "function": {"name": tool_name, "arguments": login_args},
+                        }]},
+                        {"role": "tool", "name": tool_name, "tool_call_id": call_id,
+                         "content": wrap_tool_result(profile, tool_name, login_fail_str, True)},
+                        {"role": "assistant", "content": f"❌ **空间登录失败**：登录接口返回异常，无法登录 space `{code}`。请检查本地登录服务（端口 3000）或 space 授权。"},
+                    ],
+                }))
 
             # 单轮变体：只发出工具调用，训练「首轮直接行动」的行为
             pool.append((key, group_id, {

@@ -81,17 +81,18 @@ def make_sft_config():
 
     return SFTConfig(
         output_dir=str(config.CHECKPOINTS),
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=2,
-        learning_rate=3e-4,          # 2e-4 -> 3e-4：全局 batch 4 -> 8 的补偿
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=4,
+        gradient_checkpointing=True,
+        learning_rate=1.5e-4,        # 4B 模型 LoRA 调优为 1.5e-4，平滑梯度收敛
         fp16=True,                   # T4(Turing) 不支持 bf16，继续用 fp16 + GradScaler
         lr_scheduler_type="cosine",
         warmup_steps=10,
         max_grad_norm=1.0,
         num_train_epochs=2,
         logging_steps=10,            # 每 10 步往 TensorBoard 写一次
-        eval_strategy = "steps",
+        eval_strategy="steps",
         eval_steps=20,
         save_strategy="steps",
         save_steps=20,
@@ -145,7 +146,7 @@ def main():
     is_main_process = int(os.environ.get("LOCAL_RANK", 0)) == 0
 
     data_dict = process()
-    model_name = "Qwen/Qwen3-1.7B"
+    model_name = getattr(config, "BASE_MODEL_NAME", "Qwen/Qwen3-4B")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -155,10 +156,18 @@ def main():
         print(f"训练集 {len(data_dict['train'])} 条 / 验证集 {len(data_dict['val'])} 条")
         check_max_length(data_dict["train"], tokenizer, MAX_LENGTH)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=torch.float16,
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=torch.float16,
+        )
+    except Exception as exc:
+        print(f"[提示] AutoModelForCausalLM 加载异常，尝试 AutoModelForImageTextToText: {exc}")
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_name,
+            dtype=torch.float16,
+        )
 
     sft_config = make_sft_config()
 

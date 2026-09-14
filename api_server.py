@@ -5,6 +5,7 @@ import json
 import time
 import argparse
 import asyncio
+from pathlib import Path
 from threading import Thread
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -29,6 +30,41 @@ model = None
 tokenizer = None
 current_device = "GPU"
 MODEL_PATH = r"C:\Users\azt1szh\Desktop\set\checkpoints\ov_model"
+
+
+def load_train_tool_names() -> set:
+    """动态获取训练集中的所有合法工具名称"""
+    train_file = Path(__file__).resolve().parent / "data" / "train.jsonl"
+    tools = set()
+    if train_file.exists():
+        try:
+            with open(train_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    for t in item.get("tools", []):
+                        if isinstance(t, dict):
+                            fn = t.get("function", {})
+                            name = fn.get("name") or t.get("name")
+                            if name:
+                                tools.add(name)
+        except Exception as e:
+            print(f"[警告] 动态读取训练集工具失败: {e}")
+    if not tools:
+        # 兜底：训练集标准 12 个工具
+        tools = {
+            "list_dir", "search_file", "search_content", "read_file",
+            "read_lints", "replace_in_file", "write_to_file",
+            "execute_command", "delete_file",
+            "Bash", "terminal", "run_terminal_cmd"
+        }
+    return tools
+
+
+TRAIN_TOOL_NAMES = load_train_tool_names()
+print(f"🛠️ [已加载训练集支持工具 ({len(TRAIN_TOOL_NAMES)} 个)]: {sorted(list(TRAIN_TOOL_NAMES))}")
 
 
 def load_model(device: str = "GPU"):
@@ -124,6 +160,9 @@ def parse_tool_calls(text: str):
             continue
         tool_name, args = robust_parse_tool_call(m_str)
         if tool_name:
+            if tool_name not in TRAIN_TOOL_NAMES:
+                print(f"[警告] 模型生成的工具调用 '{tool_name}' 不在训练集范围内，已过滤")
+                continue
             args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
             tool_calls.append({
                 "index": len(tool_calls),
@@ -212,31 +251,46 @@ async def chat_completions(req: ChatRequest):
     tool_count = len(req.tools) if req.tools else 0
     print(f"\n[收到请求] 消息数: {len(req.messages)}, 工具数: {tool_count}, 流式模式: {req.stream}")
 
+    filtered_tools = None
     if req.tools:
         tool_names = []
-        for t in req.tools:
-            if isinstance(t, dict):
-                fn = t.get("function", {})
-                name = fn.get("name") or t.get("name") or "unknown"
-                tool_names.append(name)
-            else:
-                tool_names.append(str(t))
-        print(f"👉 包含工具列表 ({tool_count} 个): {tool_names}")
-
-    CORE_TOOL_NAMES = {"list_dir", "search_file", "search_content", "read_file", "write_to_file", "execute_command", "delete_file", "ask_followup_question"}
-    filtered_tools = req.tools
-    if req.tools and len(req.tools) > 10:
         cleaned = []
+        discarded = []
         for t in req.tools:
             name = ""
             if isinstance(t, dict):
                 fn = t.get("function", {})
-                name = fn.get("name") or t.get("name", "")
-            if name in CORE_TOOL_NAMES:
+                name = fn.get("name") or t.get("name") or ""
+            else:
+                name = str(t)
+            tool_names.append(name)
+
+            if name in TRAIN_TOOL_NAMES:
                 cleaned.append(t)
-        if cleaned:
-            print(f"🧹 [CodeBuddy 工具清洗]: 将 {len(req.tools)} 个工具过滤精简为 {len(cleaned)} 个核心工具")
-            filtered_tools = cleaned
+            else:
+                discarded.append(name)
+
+        print(f"👉 客户端请求工具列表 ({len(req.tools)} 个): {tool_names}")
+        if discarded:
+            print(f"🚫 [已过滤丢弃非训练集工具 ({len(discarded)} 个)]: {discarded}")
+        print(f"✅ [最终送入模型的合法工具 ({len(cleaned)} 个)]: {[t.get('function', {}).get('name') or t.get('name') for t in cleaned]}")
+        filtered_tools = cleaned if cleaned else None
+
+    # 写入诊断日志，方便排查 CodeBuddy 请求的完整结构
+    debug_log = Path(__file__).resolve().parent / "api_server_debug.log"
+    try:
+        with open(debug_log, "a", encoding="utf-8") as f_log:
+            last_msg = req.messages[-1].content if req.messages else ""
+            f_log.write(f"\n{'='*50}\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 收到请求: 消息数={len(req.messages)}, 传入工具数={tool_count}, 过滤后工具数={len(filtered_tools) if filtered_tools else 0}\n")
+            if req.tools:
+                f_log.write(f"原始工具名: {tool_names}\n")
+                if discarded:
+                    f_log.write(f"被过滤工具: {discarded}\n")
+            else:
+                f_log.write("⚠️ 警告: 客户端没有传入任何 tools！\n")
+            f_log.write(f"最后一条用户消息: {str(last_msg)[:150]}\n")
+    except Exception:
+        pass
 
     msgs = []
     for m in req.messages:
@@ -286,6 +340,14 @@ async def chat_completions(req: ChatRequest):
         print(f"[ToolCalls 解析成功]: {json.dumps(tool_calls, ensure_ascii=False)}")
     else:
         print(f"[回复生成]: {clean_content}")
+
+    try:
+        with open(debug_log, "a", encoding="utf-8") as f_log:
+            f_log.write(f"Prompt 包含 <tools>: {'<tools>' in text}\n")
+            f_log.write(f"模型原始生成 (前 300 字): {raw_reply[:300]}...\n")
+            f_log.write(f"解析到 tool_calls: {bool(tool_calls)}\n{'='*50}\n")
+    except Exception:
+        pass
 
     # 1. 流式响应 (Stream = True)
     if req.stream:

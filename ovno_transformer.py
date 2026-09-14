@@ -1,27 +1,36 @@
 import os
 from pathlib import Path
-from optimum.intel.openvino import OVModelForCausalLM
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+from optimum.intel.openvino import OVModelForCausalLM, OVWeightQuantizationConfig
 from transformers import AutoTokenizer
 
 # 模型源：微调后合并的完整模型目录
-MERGED_DIR = Path(r"C:\Users\azt1szh\Desktop\set\checkpoints\merged")
-HF_CACHE_SNAPSHOT = Path(r"C:\Users\azt1szh\.cache\huggingface\hub\models--Qwen--Qwen3-1.7B\snapshots\70d244cc86ccca08cf5af4e1e306ecf908b1ad5e")
+MERGED_DIR = Path(r"C:\Users\azt1szh\Desktop\set\SFTLora\checkpoints\merged")
 
 # 使用微调后合并的完整模型目录作为输入源
 input_dir = MERGED_DIR
 output_dir = Path(r"C:\Users\azt1szh\Desktop\set\checkpoints\ov_model")
 
 print("=" * 60)
-print(f"正在将模型转换为 OpenVINO IR 格式...")
+print(f"正在将模型转换为 OpenVINO IR 格式（开启 INT4 权重压缩）...")
 print(f"输入源: {input_dir}")
 print(f"输出目录: {output_dir}")
 print("=" * 60)
 
-# 1. 导出模型（export=True 会自动转为 openvino_model.xml 和 openvino_model.bin）
+# 1. 4-bit 权重对称量化配置（大幅降低显存/内存占用，加速 Intel GPU/CPU 推理）
+quantization_config = OVWeightQuantizationConfig(
+    bits=4,
+    sym=True,
+    group_size=128,
+    ratio=0.8,
+)
+
+# 2. 导出模型（export=True 会自动转为 4-bit openvino_model.xml 和 openvino_model.bin）
 model = OVModelForCausalLM.from_pretrained(
     input_dir,
     export=True,
-    compile=False
+    compile=False,
+    quantization_config=quantization_config,
 )
 model.save_pretrained(output_dir)
 

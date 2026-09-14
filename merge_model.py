@@ -8,12 +8,20 @@ import config
 import torch
 
 def main():
-    model_name = "Qwen/Qwen3-1.7B"
+    model_name = getattr(config, "BASE_MODEL_NAME", "Qwen/Qwen3-4B")
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=torch.float16,
-    )
+    try:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=torch.float16,
+        )
+    except Exception as exc:
+        print(f"[提示] AutoModelForCausalLM 加载异常，尝试 AutoModelForImageTextToText: {exc}")
+        from transformers import AutoModelForImageTextToText
+        base_model = AutoModelForImageTextToText.from_pretrained(
+            model_name,
+            dtype=torch.float16,
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
