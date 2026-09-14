@@ -12,15 +12,16 @@ import torch
 import transformers
 import trl
 import config
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
+                          DataCollatorForSeq2Seq)
 from trl import SFTConfig, SFTTrainer
 from process import process
 from peft import LoraConfig, prepare_model_for_kbit_training
 
 # 单条样本的最大 token 数。
-# 实测数据集中全量最长样本仅 3390 token（均值约 2082 token）。
-# 设置为 3840 即可留足约 450 token 安全余量，避免盲目设为 8192 浪费多余的注意力和位置张量显存。
-MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "3840"))
+# 实测当前数据集最长样本 3816 token（均值约 2237），比上一版长约 340 token（提示词加了 MPB 对照表）。
+# 设为 4352 留出约 530 token 余量；盲目设 8192 只会白吃注意力和位置张量的显存。
+MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "4352"))
 
 
 def check_max_length(train_dataset, tokenizer, max_length):
@@ -92,6 +93,52 @@ def check_precision(model):
               f"{' ...' if len(risky) > 5 else ''}")
 
 
+def tokenize_assistant_only(example, tokenizer, max_length):
+    """把一条样本 tokenize 成 input_ids + labels，并且只让 assistant 段参与 loss。
+
+    为什么要自己算：Qwen3 的 chat template 里没有 `{% generation %}` 标记，
+    TRL 的 `assistant_only_loss=True` 会直接报错（实测 `return_assistant_tokens_mask=True`
+    抛 "chat template does not contain {% generation %} keyword"）。
+    做法：prompt = 渲染到「生成提示符」为止，full = 完整渲染；已用全部 837 条训练样本验证过
+    「prompt 的 token 是 full 的前缀」，于是 labels = [-100]*len(prompt) + full[len(prompt):]。
+
+    效果：95%+ 的 prompt token（system/SOP/工具 schema/工具返回）照样进模型当上下文，
+    只是不再参与梯度 —— 把约 25 倍的梯度权重让给真正要学的行为段（实测 4.0% -> 100%）。
+    """
+    prompt_ids = tokenizer(
+        tokenizer.apply_chat_template(example["messages"][:-1], tools=example.get("tools"),
+                                      tokenize=False, add_generation_prompt=True))["input_ids"]
+    full_ids = tokenizer(
+        tokenizer.apply_chat_template(example["messages"], tools=example.get("tools"),
+                                      tokenize=False, add_generation_prompt=False))["input_ids"]
+
+    if full_ids[:len(prompt_ids)] != prompt_ids:
+        # 模板行为与预期不一致时保守退回「整段监督」，并在 check_supervision 里报出来
+        labels = list(full_ids)
+    else:
+        labels = [-100] * len(prompt_ids) + list(full_ids[len(prompt_ids):])
+
+    return {"input_ids": full_ids[:max_length], "labels": labels[:max_length]}
+
+
+def check_supervision(rows):
+    """自检 mask 是否真的生效。
+
+    mask 生效时只有最后一个 assistant 回合计入 loss，占比约 4%（其余是 system/SOP/工具 schema/工具返回）；
+    占比接近 100% 则说明前缀校验失败、退化回了「整段监督」。
+    """
+    total = sum(len(row["input_ids"]) for row in rows)
+    supervised = sum(sum(1 for token in row["labels"] if token != -100) for row in rows)
+    ratio = supervised / total if total else 0.0
+    print(f"[监督自检] {len(rows)} 条样本：全量 {total} token / 计入 loss {supervised} token"
+          f"（{ratio:.1%}）")
+    if supervised == 0:
+        raise ValueError("[监督自检失败] 没有任何 token 参与 loss，mask 写错了。")
+    if ratio > 0.5:
+        print("[监督自检][警告] 计入 loss 的占比过高，mask 很可能没生效（前缀校验全失败？）")
+    return ratio
+
+
 def make_sft_config():
     """按当前 TRL 版本支持的字段名构造 SFTConfig（max_length / max_seq_length 兼容）。"""
     supported = set(inspect.signature(SFTConfig.__init__).parameters)
@@ -103,6 +150,16 @@ def make_sft_config():
         extra_kwargs["max_seq_length"] = MAX_LENGTH
     else:
         print("[警告] 当前 TRL 版本没有 max_length / max_seq_length 字段，请手动确认截断行为")
+
+    # assistant 段 mask 依赖「跳过 TRL 的数据预处理」（数据已在 main 里 tokenize 并打好 labels）
+    # 与「保住 labels 列」。缺任一项都会静默训错，所以这里直接卡死，不做降级。
+    if "dataset_kwargs" not in supported:
+        raise RuntimeError(
+            "当前 TRL 的 SFTConfig 不支持 dataset_kwargs，无法跳过 TRL 的数据预处理；"
+            "assistant 段 mask 依赖它，请升级 TRL 后再训。"
+        )
+    extra_kwargs["dataset_kwargs"] = {"skip_prepare_dataset": True}
+    extra_kwargs["remove_unused_columns"] = False
 
     return SFTConfig(
         output_dir=str(config.CHECKPOINTS),
@@ -185,6 +242,22 @@ def main():
         print(f"训练集 {len(data_dict['train'])} 条 / 验证集 {len(data_dict['val'])} 条")
         check_max_length(data_dict["train"], tokenizer, MAX_LENGTH)
 
+    # tokenize + assistant 段 mask。放在模型加载之前，早失败早收工。
+    train_dataset = data_dict["train"].map(
+        tokenize_assistant_only,
+        fn_kwargs={"tokenizer": tokenizer, "max_length": MAX_LENGTH},
+        remove_columns=data_dict["train"].column_names,
+        desc="tokenize + mask (train)",
+    )
+    eval_dataset = data_dict["val"].map(
+        tokenize_assistant_only,
+        fn_kwargs={"tokenizer": tokenizer, "max_length": MAX_LENGTH},
+        remove_columns=data_dict["val"].column_names,
+        desc="tokenize + mask (val)",
+    )
+    if is_main_process:
+        check_supervision(train_dataset)
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device_map = {"": local_rank} if torch.cuda.is_available() else None
 
@@ -233,12 +306,17 @@ def main():
         ],
     )
 
+    # 数据已经 tokenize 好并打好 labels（skip_prepare_dataset=True），collator 只负责 padding
+    collator = DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100,
+                                      pad_to_multiple_of=8)
+
     trainer = SFTTrainer(
         model=model,
         args=sft_config,
         peft_config=peft_config,
-        train_dataset=data_dict["train"],
-        eval_dataset=data_dict["val"],
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=collator,
         processing_class = tokenizer,
     )
 

@@ -38,10 +38,27 @@ FAIL_BRANCHES_PER_TRAJECTORY = 3
 # agent 提示词（工具菜单）里声明的每条工具，至少要在这条数以上的样本里被真正调用过。
 # 只给 schema 不给示范，模型只能猜参数怎么填，到了真实环境就会拿 shell 命令硬凑。
 MIN_TOOL_COVERAGE = 5
+
+# 关键命令至少要在这么多样本里当「监督目标」（= 最后一条 assistant，即要求模型生成它的位置）。
+# 实测教训：旧数据里 mbt build 出现在 159 处，但真正要求模型生成的只有 23 条，
+# 结果动作序列学会了、命令字面量没学会（线上表现为瞎试 -l/-f/-d、登录 code 与路由幻觉）。
+MIN_KEY_COMMAND_TARGET = 50
+
+# (标签, 命令里必须出现的片段)，供「命令目标曝光」自检使用
+KEY_COMMANDS = [
+    ("空间登录", "space/login"),
+    ("MTA 构建", "mbt build"),
+    ("CF 部署", "cf deploy"),
+    ("环境清理", "Remove-Item"),
+]
 # 采样重复：规则少了之后（14 -> 3），靠重复把「登录 code / mta 文件」映射的曝光量补回来。
 # 基础每条规则 2 轮；歧义规则（code 历史上跨工作区复用）3 轮。
 BASE_REPEAT = 2
 AMBIGUOUS_REPEAT = 3
+
+# 单步动作族（构建 / 部署 / 清理等）的重复轮数。
+# 这一族是「关键命令当答案」的主力：动作列表复制 STEP_REPEAT 遍，命令作为监督目标的次数直接 ×N。
+STEP_REPEAT = 4
 
 rng = random.Random(SEED)
 
@@ -518,11 +535,19 @@ def pick_system_prompt(profile):
         _BASE_SYSTEM_PROMPT_NEUTRAL_EN,
     ])
 
-# btp-deploy agent 的指令正文（= .codebuddy/agents/btp-deploy.md 的内容）。
-# 相比线上版本补了一步「空间登录」，因为部署前必须先登录，否则后续 cf deploy 无法执行。
+# btp-deploy agent 的指令正文（= .codebuddy/agents/btp-deploy.md 的正文）。
+# 与线上提示词逐字一致，唯一新增的是一张「项目/环境 <-> 登录 code <-> MTA 文件」对照表。
+# 原则：方法层面的东西（命令具体怎么写、失败怎么处理）一律不进提示词，全部交给样本去教会模型。
 DEPLOY_AGENT_INSTRUCTION = (
     "请根据以下步骤帮我完成 SAP BTP 项目的构建与部署，注意：不要对项目的源代码做任何检查、审查或分析，"
     "也不要尝试理解或修改代码内容，严格按照下面的步骤直接执行部署操作即可。\n\n"
+    "## 工作区 / 项目 / 环境 / 登录 code / MTA 文件 对照表（MPB 工作区）\n\n"
+    "| 项目 | 环境 | 登录 code | MTA 文件 |\n"
+    "| --- | --- | --- | --- |\n"
+    "| HC | 开发环境 | `163-d-hc` | `mta-develop-hc.yaml` |\n"
+    "| CPT | 开发环境 | `162-d-cpt` | `mta-develop.yaml` |\n"
+    "| PT | 开发环境 | `162-d-pt` | `mta-develop-pt.yaml` |\n\n"
+    "登录 code 必须从上表原样复制，不要自行推测或改写格式。\n\n"
     "首先根据目标环境匹配对应的登录 code，调用本地登录接口完成 BTP 空间登录。\n\n"
     "接着根据部署环境，找到对应的mta文件，找到匹配的 YAML 文件后，"
     "将其完整内容复制到根目录下的 mta.yaml 文件中，如果根目录没有mta.yaml文件就新建一个。\n\n"
@@ -879,6 +904,26 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
 
     samples = []
 
+    def windowed_samples(history, target):
+        """同一个目标动作用多个历史窗口各生成一条样本（完整 / 近 2 步 / 近 1 步）。
+
+        模型记住一条命令靠的是「它当过几次答案」，而不是它在上下文里出现过几次：
+        只做完整前缀展开时，每条命令在整组里只有 1 次是答案，其余全是背景。
+        多窗口同时顺带教会「历史被截断时也能接上下一步」。
+        """
+        out = []
+        seen_lengths = set()
+        for window in (None, 2, 1):
+            hist = history if window is None else history[-2 * window:]
+            if len(hist) in seen_lengths:  # 历史本来就很短时几个窗口会重合，去重
+                continue
+            seen_lengths.add(len(hist))
+            out.append({
+                "tools": tools_list,
+                "messages": base_messages + list(hist) + [target],
+            })
+        return out
+
     # ---- 冷启动：目标是第 1 步 ----
     samples.append({"tools": tools_list, "messages": base_messages + [steps[0]["pre"]]})
 
@@ -887,10 +932,7 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
     for index, step in enumerate(steps):
         history.extend([step["pre"], make_result(step["pre"], step["ok"])])
         if index + 1 < len(steps):
-            samples.append({
-                "tools": tools_list,
-                "messages": base_messages + list(history) + [steps[index + 1]["pre"]],
-            })
+            samples.extend(windowed_samples(history, steps[index + 1]["pre"]))
     # ---- 全部步骤走完：目标是最终汇报（唯一允许出现完成态措辞的地方）----
     samples.append({
         "tools": tools_list,
@@ -906,11 +948,9 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
             fail_history.extend([step["pre"], make_result(step["pre"], step["ok"])])
         fail_step = steps[fail_index]
         fail_history.extend([fail_step["pre"], make_result(fail_step["pre"], fail_step["fail"])])
-        samples.append({
-            "tools": tools_list,
-            "messages": base_messages + list(fail_history)
-                        + [error_summary(fail_index, fail_step["label"])],
-        })
+        # 「看到失败 → 中止并汇报」同样用多窗口，避免只在完整历史下才学得会
+        samples.extend(windowed_samples(fail_history,
+                                        error_summary(fail_index, fail_step["label"])))
 
     return samples
 
@@ -971,6 +1011,19 @@ LOGIN_TEMPLATES = [
     "在 {ws} 工作区下部署 {proj} 的 {env}，帮我调登录接口并告知 mta 文件",
     "帮我调一下本地登录 API：工作区 {ws}，项目 {proj}，环境 {env}",
     "请协助登录 {ws} 的 {proj} 项目（{env}），告知对应的 mta 部署文件",
+    "登录 {ws} 的 {proj}（{env}），对应的登录 code 是多少？",
+    "切到 {ws} 工作区 {proj} 的 {env}，先做空间登录",
+    "帮我用本地接口登录 {ws} {proj} 的 {env}",
+]
+
+# 登录失败的真实回包（{code} 会被替换成规则里的 code）。
+# 后两类是线上实际遇到过的：space 未注册（500）与路由写错导致返回 404 页面而不是 JSON。
+LOGIN_FAILURES = [
+    "Invoke-RestMethod : The remote server returned an error: (401) Unauthorized.\r\nlogin failed for space '{code}'",
+    "Invoke-RestMethod : {\"code\":500,\"data\":\"error\",\"message\":\"Internal Server Error: space '{code}' not found\"}",
+    "Invoke-RestMethod : {\"code\":500,\"data\":\"error\",\"message\":\"Internal Server Error: space '{code}' not registered\"}",
+    "<!DOCTYPE html>\r\n<html lang=\"en\">\r\n  <head>\r\n    <meta charset=\"utf-8\">\r\n    <title>Error</title>\r\n  </head>\r\n  <body>\r\n    <pre>Cannot POST /api/login</pre>\r\n  </body>\r\n</html>",
+    "Invoke-RestMethod : 无法连接到远程服务器 http://localhost:3000/space/login\r\nConnect-Failure: No connection could be made because the target machine actively refused it 127.0.0.1:3000",
 ]
 
 
@@ -1027,13 +1080,17 @@ def build_login_action_samples():
                 ],
             }))
 
-            # 增加登录失败分支样本：让模型在单点动作中也学会根据返回结果判断成功/失败
-            if index % 2 == 0:
-                login_fail_str = rng.choice([
-                    f"Invoke-RestMethod : The remote server returned an error: (401) Unauthorized.\r\nlogin failed for space '{code}'",
-                    f"Invoke-RestMethod : {{\"code\":500,\"data\":\"error\",\"message\":\"Internal Server Error: space '{code}' not found\"}}",
-                ])
-                pool.append((key, group_id + "|fail", {
+            # 登录失败分支：教「失败就中止并汇报」，而不是闷头继续往下走。
+            # 覆盖真实回包里的各类形态：401 / 500(space 未注册或不存在) / 路由写错返回 404 页面 / 连不上本地服务
+            for fail_offset, fail_template in enumerate(rng.sample(LOGIN_FAILURES, k=2)):
+                login_fail_str = fail_template.replace("{code}", code)
+                if "<!DOCTYPE" in login_fail_str:
+                    fail_summary = ("❌ **空间登录失败**：登录接口返回的不是 JSON 而是 404 页面，"
+                                    "说明请求地址不对。已停止后续流程，请确认登录接口路径后重试。")
+                else:
+                    fail_summary = (f"❌ **空间登录失败**：登录接口返回异常，无法登录 space `{code}`。"
+                                    f"已停止后续流程，请检查本地登录服务（端口 3000）与空间授权后重试。")
+                pool.append((key, group_id + f"|fail{fail_offset}", {
                     "tools": tools_list,
                     "messages": [
                         {"role": "system", "content": pick_system_prompt(profile)},
@@ -1044,24 +1101,59 @@ def build_login_action_samples():
                         }]},
                         {"role": "tool", "name": tool_name, "tool_call_id": call_id,
                          "content": wrap_tool_result(profile, tool_name, login_fail_str, True)},
-                        {"role": "assistant", "content": f"❌ **空间登录失败**：登录接口返回异常，无法登录 space `{code}`。请检查本地登录服务（端口 3000）或 space 授权。"},
+                        {"role": "assistant", "content": fail_summary},
                     ],
                 }))
 
-            # 单轮变体：只发出工具调用，训练「首轮直接行动」的行为
-            pool.append((key, group_id, {
-                "tools": tools_list,
-                "messages": [
-                    {"role": "system", "content": pick_system_prompt(profile)},
-                    {"role": "user", "content": user_text},
-                    {"role": "assistant",
-                     "content": f"登录 code: {code}\nMTA 文件: {mta}",
-                     "tool_calls": [{
-                         "id": call_id, "type": "function",
-                         "function": {"name": tool_name, "arguments": login_args},
-                     }]},
-                ],
-            }))
+            # code 写错的自纠样本：历史里是错的 code（不参与监督），目标是「中止 + 按对照表核对」
+            # —— 线上就是这么翻车的（space='123-d-pt' 属于凭空捏造，数据里根本没有这个值）
+            if index % 2 == 0:
+                wrong_code = code[:-1] + rng.choice("0123456789")
+                if wrong_code == code:
+                    wrong_code = code + "9"
+                wrong_args = json.dumps(
+                    build_arguments(profile,
+                                    login_cmd.replace(f"'{code}'", f"'{wrong_code}'"),
+                                    "登录 BTP 空间", True), ensure_ascii=False)
+                pool.append((key, group_id + "|wrong-code", {
+                    "tools": tools_list,
+                    "messages": [
+                        {"role": "system", "content": pick_system_prompt(profile)},
+                        {"role": "user", "content": user_text},
+                        {"role": "assistant", "content": "", "tool_calls": [{
+                            "id": call_id, "type": "function",
+                            "function": {"name": tool_name, "arguments": wrong_args},
+                        }]},
+                        {"role": "tool", "name": tool_name, "tool_call_id": call_id,
+                         "content": wrap_tool_result(
+                             profile, tool_name,
+                             LOGIN_FAILURES[2].replace("{code}", wrong_code), True)},
+                        {"role": "assistant", "content": (
+                            f"❌ **空间登录失败**：space `{wrong_code}` 未注册，登录 code 写错了。"
+                            f"已停止后续流程；请按对照表核对目标环境对应的 code（当前应为 `{code}`）后重试。")},
+                    ],
+                }))
+
+            # 单轮变体：只发出工具调用，训练「首轮直接行动」的行为。
+            # 同一模板出两条（旁白措辞不同），把「登录命令当答案」的曝光翻倍 ——
+            # 这一条命令是线上最容易翻车的地方（space 写成幻觉值、路由写成 /api/login）。
+            for cold_index, cold_narration in enumerate([
+                f"登录 code: {code}\nMTA 文件: {mta}",
+                f"用对照表里 {ws} {proj}（{env_disp}）对应的 code `{code}` 完成空间登录：",
+            ]):
+                pool.append((key, group_id + f"|cold{cold_index}", {
+                    "tools": tools_list,
+                    "messages": [
+                        {"role": "system", "content": pick_system_prompt(profile)},
+                        {"role": "user", "content": user_text},
+                        {"role": "assistant",
+                         "content": cold_narration,
+                         "tool_calls": [{
+                             "id": f"call_login_{uuid.uuid4().hex[:8]}", "type": "function",
+                             "function": {"name": tool_name, "arguments": login_args},
+                         }]},
+                    ],
+                }))
 
     return pool
 
@@ -1174,6 +1266,10 @@ def build_devops_action_samples():
                 "result": "",
                 "final": "清理完成，临时文件与构建产物已删除，项目目录已恢复干净状态。",
             })
+
+        # 重复采样：这一族是「关键命令当答案」的主力，把动作列表复制若干遍，
+        # 让 mbt build / cf deploy / Remove-Item 这些命令作为监督目标出现的次数直接翻倍。
+        actions = actions * STEP_REPEAT
 
         for index, action in enumerate(actions):
             profile = pick_profile()
@@ -1289,6 +1385,8 @@ def build_explore_samples():
                     f"{ws} 工作区项目根目录下都有哪些文件？",
                     f"列一下 {ws} 工作区的项目文件，我确认下 mta 配置在不在根目录",
                     f"{ws} 这个项目里有什么？mta 配置文件放在哪一层？",
+                    "根目录下有哪些文件？",
+                    f"帮我列一下 {ws} 项目根目录的清单",
                 ],
                 "calls": [("先看一下项目根目录的结构：", "list_dir",
                            {"target_directory": root}, listing)],
@@ -1418,6 +1516,188 @@ def build_edit_samples():
                                   "messages": call_sequence_messages(
                                       pick_system_prompt(codebuddy), user_text, calls,
                                       item["final"])}))
+
+    return pool
+
+
+# ============================================================
+# 8.5 恢复样本族 + 工具字段语义族
+# ============================================================
+# 线上最致命的两类错误都出在「出错之后」：
+#   1. 把同一条错误调用原样重发 5 次（CodeBuddy 都注入 loop 提示了也不停）；
+#   2. 把目录路径塞进 search_file 的 pattern，文件明明存在却 Found 0 files。
+# 这一族专门教「怎么纠正」：换正确字段 / 换更精确的取法；仍然失败就按 SOP 中止。
+# 监督目标只放在「正确的那一次」上，错误调用只作为历史上下文出现（不参与监督）。
+
+
+def _codebuddy_profile():
+    return next(p for p in TOOL_PROFILES if p["id"] == "codebuddy")
+
+
+def build_recovery_samples():
+    """恢复样本：字段语义纠错 / 归档行取不到时改精确匹配 / 二次失败即中止。"""
+    pool = []
+    codebuddy = _codebuddy_profile()
+
+    for rule in RULES:
+        ws = rule["workspace"]
+        proj = rule["project"]
+        env_disp = ENV_DISPLAY[rule["env"]]
+        root = project_root(rule)
+        mta_file = rule["mta"]
+        archives_dir = f"{root}\\mta_archives"
+        mtar_name = f"{proj.lower()}-mpb-d_1.0.0.mtar"
+
+        # ---- A. pattern 里塞了目录 -> Found 0 files -> 换正确字段重试 ----
+        wrong_call = make_call(
+            f"先找一下 {proj} 在 {env_disp} 用的 MTA 文件：",
+            "search_file",
+            {"target_directory": root, "pattern": f"mta\\{mta_file}", "recursive": True})
+        pool.append((f"RECOVER|{ws}", f"recover|{ws}|{proj}|pattern-field", {
+            "tools": make_tools_list(codebuddy),
+            "messages": [
+                {"role": "system", "content": pick_system_prompt(codebuddy)},
+                {"role": "user", "content": f"帮我找到 {ws} 工作区 {proj} 项目对应的 MTA 配置文件"},
+                wrong_call,
+                make_result(wrong_call, "Found 0 files"),
+                make_call("pattern 里不能带目录，改成通配符、把目录放在 target_directory 里重查：",
+                          "search_file",
+                          {"target_directory": root, "pattern": "mta*.yaml", "recursive": True}),
+            ],
+        }))
+
+        # ---- B. 构建日志尾部没有归档行（verbose 输出/警告行混入）-> 改用精确匹配 ----
+        noisy_build = make_call(
+            "先跑一次构建，取最后 10 行找归档路径：",
+            "execute_command",
+            {"command": "mbt build 2>&1 | Select-Object -Last 10", "requires_approval": False})
+        noisy_tail = (
+            "(node:23380) Warning: Setting the NODE_TLS_REJECT_UNAUTHORIZED environment variable to '0' "
+            "makes TLS connections and HTTPS requests insecure by disabling certificate verification.\r\n"
+            "info mpbfiori › Running task minify...\r\n"
+            "info mpbfiori › Running task generateComponentPreload...\r\n"
+            "info ProjectBuilder Executing cleanup tasks...")
+        pool.append((f"RECOVER|{ws}", f"recover|{ws}|{proj}|no-archive-line", {
+            "tools": make_tools_list(codebuddy),
+            "messages": [
+                {"role": "system", "content": pick_system_prompt(codebuddy)},
+                {"role": "user", "content": f"把 {ws} 的 {proj} 构建一下，然后告诉我归档包路径"},
+                noisy_build,
+                make_result(noisy_build, noisy_tail),
+                make_call("尾部 10 行里没有归档行（verbose 输出把尾部挤掉了）。改用精确匹配，"
+                          "把构建输出落到日志文件后只取那一行：",
+                          "execute_command",
+                          {"command": ("mbt build *> mbt_build.log; "
+                                       "Select-String -Path mbt_build.log "
+                                       "-Pattern 'the MTA archive generated at:'"),
+                           "requires_approval": False}),
+            ],
+        }))
+
+        # ---- C. 同一类调用第二次仍然失败 -> 立即中止汇报（线上曾原样重发 5 次） ----
+        first_fail = make_call(
+            "执行构建：",
+            "execute_command",
+            {"command": "mbt build -l mta.yaml -d build", "requires_approval": False})
+        second_fail = make_call(
+            "换个参数再试一次：",
+            "execute_command",
+            {"command": "mbt build --timeout 600", "requires_approval": False})
+        pool.append((f"RECOVER|{ws}", f"recover|{ws}|{proj}|retry-then-abort", {
+            "tools": make_tools_list(codebuddy),
+            "messages": [
+                {"role": "system", "content": pick_system_prompt(codebuddy)},
+                {"role": "user", "content": f"把 {proj} 项目构建一下"},
+                first_fail,
+                make_result(first_fail, "Error: unknown shorthand flag: 'l' in -l"),
+                second_fail,
+                make_result(second_fail, "Error: unknown flag: --timeout"),
+                {"role": "assistant", "content": (
+                    "❌ **构建中止**：`mbt build` 连续两次因命令参数不合法失败（`-l` / `--timeout` 都不是有效参数）。"
+                    "按流程要求已停止，不再重复执行同一命令；请确认后在项目根目录直接用 `mbt build` 重试。")},
+            ],
+        }))
+
+        # ---- D. 修好之后继续：从正确返回里取出归档路径并部署 ----
+        fixed_call = make_call(
+            "改用精确匹配从构建日志里取归档行：",
+            "execute_command",
+            {"command": "mbt build 2>&1 | Select-String -Pattern 'the MTA archive generated at:'",
+             "requires_approval": False})
+        pool.append((f"RECOVER|{ws}", f"recover|{ws}|{proj}|extract-then-deploy", {
+            "tools": make_tools_list(codebuddy),
+            "messages": [
+                {"role": "system", "content": pick_system_prompt(codebuddy)},
+                {"role": "user", "content": f"构建完成后继续把 {proj} 部署到 BTP"},
+                fixed_call,
+                make_result(fixed_call, f"[10:14:30] INFO the MTA archive generated at: mta_archives\\{mtar_name}"),
+                make_call(f"日志给的是相对路径，拼上项目根目录得到 `{archives_dir}\\{mtar_name}`，执行部署：",
+                          "execute_command",
+                          {"command": f"cf deploy {archives_dir}\\{mtar_name} -f",
+                           "requires_approval": True}),
+            ],
+        }))
+
+    return pool
+
+
+def build_field_semantics_samples():
+    """工具字段语义正例：pattern 只写文件名通配符，目录一律放 target_directory。"""
+    pool = []
+    codebuddy = _codebuddy_profile()
+
+    for rule in RULES:
+        ws = rule["workspace"]
+        proj = rule["project"]
+        root = project_root(rule)
+        mta_file = rule["mta"]
+        archives_dir = f"{root}\\mta_archives"
+
+        items = [
+            {
+                "users": [
+                    f"在 {ws} 工作区里找一下所有 mta 配置文件",
+                    "列一下工作区里有哪些 mta yaml",
+                ],
+                "args": {"target_directory": root, "pattern": "mta*.yaml", "recursive": True},
+                "result": json.dumps([f"{root}\\{mta_file}", f"{root}\\mta\\{mta_file}"], ensure_ascii=False),
+                "final": (f"工作区里共有 2 个候选：`{root}\\{mta_file}` 与 `{root}\\mta\\{mta_file}`，"
+                          f"{proj} 用的是 `{mta_file}`。"),
+            },
+            {
+                "users": [
+                    "构建产物归档包在哪？去 mta_archives 里找一下",
+                    "在 mta_archives 目录里找 .mtar 归档",
+                ],
+                "args": {"target_directory": archives_dir, "pattern": "*.mtar", "recursive": False},
+                "result": f"{archives_dir}\\{proj.lower()}-mpb-d_1.0.0.mtar",
+                "final": f"`mta_archives` 下的归档是 `{proj.lower()}-mpb-d_1.0.0.mtar`。",
+            },
+            {
+                "users": [
+                    f"确认一下 {mta_file} 在项目哪一层",
+                    f"{proj} 的 MTA 文件放在根目录还是 mta 子目录？",
+                ],
+                "args": {"target_directory": root, "pattern": mta_file, "recursive": True},
+                "result": f"{root}\\mta\\{mta_file}",
+                "final": f"`{mta_file}` 在 `mta` 子目录下（完整路径 `{root}\\mta\\{mta_file}`）。",
+            },
+        ]
+
+        for item_index, item in enumerate(items):
+            for phrase_index, user_text in enumerate(item["users"]):
+                calls = [(f"用 `pattern` 写通配符、目录放 `target_directory` 来查：",
+                          "search_file", item["args"], item["result"])]
+                system_prompt = pick_system_prompt(codebuddy)
+                pool.append((f"FIELDS|{ws}", f"fields|{ws}|{proj}|{item_index}|{phrase_index}|flow",
+                             {"tools": make_tools_list(codebuddy),
+                              "messages": call_sequence_messages(system_prompt, user_text, calls,
+                                                                  item["final"])}))
+                pool.append((f"FIELDS|{ws}", f"fields|{ws}|{proj}|{item_index}|{phrase_index}|cold",
+                             {"tools": make_tools_list(codebuddy),
+                              "messages": call_sequence_messages(system_prompt, user_text, calls,
+                                                                  final_text=None,
+                                                                  include_results=False)}))
 
     return pool
 
@@ -1689,6 +1969,39 @@ def validate_tool_coverage(rows, label, min_samples=MIN_TOOL_COVERAGE):
     return issues
 
 
+def count_command_targets(rows, fragment):
+    """统计 fragment 作为「监督目标」出现的样本数（= 最后一条 assistant 的工具调用里含它）。
+
+    注意只统计监督位置：历史上下文里出现过多少次不算数 —— 那教的是「复述」，
+    不是「接到指令后生成这条命令」。
+    """
+    hits = 0
+    for row in rows:
+        for tc in row["messages"][-1].get("tool_calls") or []:
+            if fragment in tc["function"]["arguments"]:
+                hits += 1
+                break
+    return hits
+
+
+def validate_command_exposure(rows, label, min_samples=MIN_KEY_COMMAND_TARGET):
+    """关键命令必须以「监督目标」的身份出现足够多次。
+
+    实测教训：旧数据里 `mbt build` 在 159 处出现过，但真正要求模型生成的只有 23 条，
+    结果模型学会了动作序列却记不住命令字面量（线上表现：瞎试 -l/-f/-d、登录 code 幻觉）。
+    """
+    issues = []
+    print(f"\n[{label}] 关键命令目标曝光（阈值 {min_samples} 条）：")
+    for tag, fragment in KEY_COMMANDS:
+        got = count_command_targets(rows, fragment)
+        mark = "OK" if got >= min_samples else "!!"
+        print(f"    [{mark}] {tag:<6} `{fragment}`  {got:5d} 条样本把它当监督目标")
+        if got < min_samples:
+            issues.append(f"[{label}] 关键命令 {fragment} 作为监督目标只有 {got} 条"
+                          f"（要求 ≥ {min_samples}）")
+    return issues
+
+
 def estimate_tokens(text):
     """粗略估算 token 数（中文 1 token/字，其余 0.3 token/字符）。
     真实值以 main.py 里 tokenizer 实测为准，这里只用来快速发现异常长的样本。"""
@@ -1770,6 +2083,9 @@ def run_post_generation_checks(train_data, val_data, train_file, val_file, pool)
     # agent 提示词里声明的每条工具都必须有示范：train 用阈值卡死，val 只打印（组切分后条数天然少）
     issues += validate_tool_coverage(reloaded_train, "train")
     validate_tool_coverage(reloaded_val, "val", min_samples=0)
+    # 关键命令必须作为「监督目标」出现足够多次，避免「见过很多次但没当过答案」
+    issues += validate_command_exposure(reloaded_train, "train")
+    validate_command_exposure(reloaded_val, "val", min_samples=0)
 
     rows = reloaded_train + reloaded_val
     print(f"回读样本总数: {len(rows)}  (train {len(reloaded_train)} / val {len(reloaded_val)})")
@@ -1797,20 +2113,25 @@ def generate_dataset():
     chain_pool = build_deploy_chain_samples()
     login_pool = build_login_action_samples()
     devops_pool = build_devops_action_samples()
+    recovery_pool = build_recovery_samples()
+    fields_pool = build_field_semantics_samples()
     explore_pool = build_explore_samples()
     edit_pool = build_edit_samples()
     qa_pool = build_qa_samples()
 
     print("原始生成:")
-    print(f"  - 部署流水线前缀展开 + 失败分支: {len(chain_pool)} 条 "
+    print(f"  - 部署流水线前缀展开（多历史窗口）+ 失败分支: {len(chain_pool)} 条 "
           f"({len({gid for _, gid, _ in chain_pool})} 个轨迹组)")
-    print(f"  - 登录 Action 样本: {len(login_pool)} 条")
-    print(f"  - DevOps 单步动作样本: {len(devops_pool)} 条")
+    print(f"  - 登录 Action 样本（含失败与 code 写错自纠）: {len(login_pool)} 条")
+    print(f"  - DevOps 单步动作样本（×{STEP_REPEAT} 重复采样）: {len(devops_pool)} 条")
+    print(f"  - 恢复样本（字段纠错 / 归档行取不到 / 二次失败即中止）: {len(recovery_pool)} 条")
+    print(f"  - 字段语义正例（search_file 的 pattern/target_directory）: {len(fields_pool)} 条")
     print(f"  - 工程探查样本（list_dir/search_content/read_lints）: {len(explore_pool)} 条")
     print(f"  - 文件编辑样本（read_file/replace_in_file）: {len(edit_pool)} 条")
     print(f"  - 知识库问答样本: {len(qa_pool)} 条")
 
-    all_pool = chain_pool + login_pool + devops_pool + explore_pool + edit_pool + qa_pool
+    all_pool = (chain_pool + login_pool + devops_pool + recovery_pool + fields_pool
+                + explore_pool + edit_pool + qa_pool)
     all_gids = {gid for _, gid, _ in all_pool}
     train_data, val_data, train_gids, val_gids = split_by_group(all_pool)
 
