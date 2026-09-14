@@ -20,6 +20,8 @@ SEED = 42
 #
 #   固定（invariant）  : 任务本身 + 每步要执行的 shell 命令 + 业务映射（code/mta/路径）
 #   随机（augmentation）: 调用外壳 —— 工具名、参数名、菜单里有几个工具、system prompt、语言
+#   覆盖（coverage）   : agent 菜单里声明的每一条工具，都必须有「真实发出调用」的示范样本
+#                        （只给 schema 不给示范 = 让模型猜参数怎么填，见 MIN_TOOL_COVERAGE）
 #
 # 权重向 CodeBuddy 倾斜（当前主用 harness），其余档位提供泛化能力，
 # 这样换到别的 agent 时模型能靠 prompt 里的 schema 自适应，而不是死记一个工具名。
@@ -32,6 +34,10 @@ SEED = 42
 #     → agent 暴露 9 条工具（去掉没有 schema 可查的 read_rules）
 
 FAIL_BRANCHES_PER_TRAJECTORY = 3
+
+# agent 提示词（工具菜单）里声明的每条工具，至少要在这条数以上的样本里被真正调用过。
+# 只给 schema 不给示范，模型只能猜参数怎么填，到了真实环境就会拿 shell 命令硬凑。
+MIN_TOOL_COVERAGE = 5
 # 采样重复：规则少了之后（14 -> 3），靠重复把「登录 code / mta 文件」映射的曝光量补回来。
 # 基础每条规则 2 轮；歧义规则（code 历史上跨工作区复用）3 轮。
 BASE_REPEAT = 2
@@ -410,6 +416,15 @@ def make_mta_content(project):
     )
 
 
+def project_root(rule):
+    """样本里统一的项目根目录（绝对路径）。
+
+    文件类工具（list_dir / read_file / write_to_file / delete_file）的 schema 明确要求绝对路径，
+    所以给这些工具的参数、以及构建日志里出现的路径，都从这里派生，保证全样本口径一致。
+    """
+    return f"C:\\work\\{rule['workspace']}"
+
+
 def locate_mta(rule):
     """返回 (匹配到的源文件相对路径, 该工作区下的全部 mta 候选文件)。
 
@@ -566,7 +581,7 @@ def make_chain_mtar(rule):
     """
     name = make_mtar_name(rule["project"])
     rel = f"mta_archives\\{name}"
-    root = f"C:\\work\\{rule['workspace']}"
+    root = project_root(rule)
     if rng.random() < 0.5:
         return rel, f"{root}\\{rel}", root, True
     full = f"{root}\\{rel}"
@@ -705,30 +720,44 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
     ]
 
     # ---- 「找到对应 mta 文件并复制为根目录 mta.yaml」按档位展开 ----
-    # CodeBuddy 档位 -> 先用 search_file 定位文件，再用 execute_command 执行 Copy-Item 复制；
+    # CodeBuddy 档位严格照 SOP 走原生三步：定位文件 -> 读完整内容 -> 写成根目录 mta.yaml。
+    # 这三步正好让 search_file / read_file / write_to_file 都拿到真实演示；
+    # 把「复制」糊成一条 Copy-Item 会让模型在真实环境里只会硬凑 shell 命令。
     # 只有 shell 的档位 -> 一条「递归查找 + 复制」命令。
+    root = project_root(rule)
+    mta_content = make_mta_content(proj)
     if profile["id"] == "codebuddy":
+        mta_abs = f"{root}\\{mta_src}"
+        mta_yaml_abs = f"{root}\\mta.yaml"
         steps.append({
             "key": "copy",
             "pre": make_call(
                 f"空间 `{code}` 已登录。接下来在项目中查找与 {env_disp} 匹配的 MTA 配置文件：",
                 "search_file",
-                {"target_directory": ".", "pattern": "mta*.yaml", "recursive": True}),
-            "ok": json.dumps(mta_candidates, ensure_ascii=False),
+                {"target_directory": root, "pattern": "mta*.yaml", "recursive": True}),
+            "ok": json.dumps([f"{root}\\{c}" for c in mta_candidates], ensure_ascii=False),
             "fail": "",
             "label": "查找 MTA 文件",
         })
         steps.append({
             "key": "copy",
-            "pre": shell_call(
-                f"已定位到匹配文件 `{mta_src}`，将其复制为根目录下的 `mta.yaml`"
-                "（不存在就新建，已存在就覆盖）：",
-                f"Copy-Item {mta_src} mta.yaml -Force",
-                False,
-                "复制 MTA 配置文件为 mta.yaml"),
-            "ok": wrap_tool_result(profile, tool_name, "", False),
-            "fail": wrap_tool_result(profile, tool_name, f"Copy-Item : Cannot find path '{mta_src}' because it does not exist.", True),
-            "label": "复制 MTA 文件",
+            "pre": make_call(
+                f"已定位到 `{mta_abs}`，读取它的完整内容：",
+                "read_file",
+                {"filePath": mta_abs}),
+            "ok": mta_content,
+            "fail": "",
+            "label": "读取 MTA 内容",
+        })
+        steps.append({
+            "key": "copy",
+            "pre": make_call(
+                f"内容已取得，写入根目录 `{mta_yaml_abs}`（不存在就新建，已存在就覆盖）：",
+                "write_to_file",
+                {"filePath": mta_yaml_abs, "content": mta_content}),
+            "ok": "",
+            "fail": "",
+            "label": "写入 mta.yaml",
         })
     else:
         copy_cmd = (f"$f=(Get-ChildItem -Path . -Recurse -File -Filter {mta} "
@@ -780,14 +809,36 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
         "label": "CF 部署（cf deploy）",
     })
 
+    if profile["id"] == "codebuddy":
+        # 根目录 mta.yaml 是「文件」，交给 delete_file 更贴合工具语义，也让 delete_file 拿到真实演示；
+        # 目录与构建产物再交给 execute_command（此时已不含 mta.yaml，避免重复删同一个东西）。
+        steps.append({
+            "key": "clean",
+            "pre": make_call(
+                "部署动作已返回成功。先删除临时创建的根目录 `mta.yaml`：",
+                "delete_file",
+                {"target_file": f"{root}\\mta.yaml"}),
+            "ok": "",
+            "fail": "",
+            "label": "删除临时 mta.yaml",
+        })
+        clean_narration = (
+            "`mta.yaml` 已删除。接着清理 `mta_archives` 目录、生成的 `.mtar` 归档"
+            "与 `.mta_build_tmp` 等构建产物："
+        )
+        clean_cmd = ("Remove-Item -Path mta_archives, .mta_build_tmp "
+                     "-Recurse -Force -ErrorAction SilentlyContinue")
+    else:
+        clean_narration = (
+            "部署动作已返回成功。接下来执行清理，删除临时 `mta.yaml`、`mta_archives` 目录"
+            "以及 `.mta_build_tmp` 等构建产物："
+        )
+        clean_cmd = ("Remove-Item -Path mta.yaml, mta_archives, .mta_build_tmp "
+                     "-Recurse -Force -ErrorAction SilentlyContinue")
+
     steps.append({
         "key": "clean",
-        "pre": shell_call(
-            "部署动作已返回成功。接下来执行清理，删除临时 `mta.yaml`、`mta_archives` 目录"
-            "以及 `.mta_build_tmp` 等构建产物：",
-            ("Remove-Item -Path mta.yaml, mta_archives, .mta_build_tmp "
-             "-Recurse -Force -ErrorAction SilentlyContinue"),
-            True, "清理临时构建产物"),
+        "pre": shell_call(clean_narration, clean_cmd, True, "清理临时构建产物"),
         "ok": wrap_tool_result(profile, tool_name, "", False),
         "fail": "",
         "label": "环境清理",
@@ -1029,14 +1080,18 @@ def _copy_action_calls(profile, rule, env_str, mta_src, mta_candidates, action):
     (command, requires_approval, short_desc, is_long_running)。
     """
     if profile["id"] == "codebuddy":
+        root = project_root(rule)
+        mta_abs = f"{root}\\{mta_src}"
+        mta_yaml_abs = f"{root}\\mta.yaml"
+        mta_content = make_mta_content(rule["project"])
         return [
             (f"正在查找与 {env_str} 匹配的 MTA 配置文件：", "search_file",
-             {"target_directory": ".", "pattern": "mta*.yaml", "recursive": True},
-             json.dumps(mta_candidates, ensure_ascii=False)),
-            (f"已定位到 `{mta_src}`，将其复制为根目录下的 `mta.yaml`（不存在就新建，已存在就覆盖）：",
-             "shell",
-             (f"Copy-Item {mta_src} mta.yaml -Force", False, "复制 MTA 配置文件为 mta.yaml", False),
-             ""),
+             {"target_directory": root, "pattern": "mta*.yaml", "recursive": True},
+             json.dumps([f"{root}\\{c}" for c in mta_candidates], ensure_ascii=False)),
+            (f"已定位到 `{mta_abs}`，读取它的完整内容：", "read_file",
+             {"filePath": mta_abs}, mta_content),
+            (f"内容已取得，写入根目录 `{mta_yaml_abs}`（不存在就新建，已存在就覆盖）：", "write_to_file",
+             {"filePath": mta_yaml_abs, "content": mta_content}, ""),
         ]
     copy_cmd = (f"$f=(Get-ChildItem -Path . -Recurse -File -Filter {rule['mta']} "
                 "| Select-Object -First 1).FullName; Copy-Item $f -Destination mta.yaml -Force")
@@ -1111,7 +1166,7 @@ def build_devops_action_samples():
             "删除临时创建的 mta.yaml 和 .mta_build_tmp 临时目录",
         ], k=2):
             actions.append({
-                "kind": "shell", "user": q,
+                "kind": "clean", "user": q,
                 "pre": "正在清理临时 `mta.yaml`、`mta_archives` 与 `.mta_build_tmp`：",
                 "cmd": ("Remove-Item -Path mta.yaml, mta_archives, .mta_build_tmp "
                         "-Recurse -Force -ErrorAction SilentlyContinue"),
@@ -1128,6 +1183,19 @@ def build_devops_action_samples():
                                            mta_candidates, action)
                 final_text = (f"`{mta_src}` 已成功复制为根目录 `mta.yaml`。"
                               if profile["id"] == "codebuddy" else action["final_shell"])
+            elif action["kind"] == "clean" and profile["id"] == "codebuddy":
+                # 与完整部署链保持同一口径：文件交给 delete_file，目录交给 execute_command
+                api_root = project_root(rule)
+                calls = [
+                    ("正在删除临时创建的根目录 `mta.yaml`：", "delete_file",
+                     {"target_file": f"{api_root}\\mta.yaml"}, ""),
+                    ("`mta.yaml` 已删除。接着清理 `mta_archives` 与 `.mta_build_tmp`：", "shell",
+                     ("Remove-Item -Path mta_archives, .mta_build_tmp "
+                      "-Recurse -Force -ErrorAction SilentlyContinue",
+                      True, "清理临时构建产物", False),
+                     ""),
+                ]
+                final_text = action["final"]
             else:
                 calls = [(action["pre"], "shell",
                           (action["cmd"], action["approval"], action["desc"], action["long"]),
@@ -1159,7 +1227,203 @@ def build_devops_action_samples():
 
 
 # ============================================================
-# 8. 知识库问答样本（不触发 tool_call）
+# 8. 工程探查与文件编辑样本（补齐 agent 提示词里其余工具的示范）
+# ============================================================
+# agent 的工具菜单里有 9 条 schema，但部署 SOP 只会用到 5 条：
+#   execute_command / search_file / read_file / write_to_file / delete_file
+# 剩下 list_dir / search_content / read_lints / replace_in_file 有 schema 却从没被演示过——
+# 模型只能猜参数怎么填，到了真实环境就会拿 shell 命令硬凑。所以这里单独建两族样本补齐。
+# 注意：这些请求不属于 btp-deploy 的 SOP（SOP 明确要求「不要检查/审查/分析代码」），
+# 因此 system prompt 只用通用行为约束、不拼 SOP，避免教模型违反自己的指令。
+
+
+def make_dir_listing(mta_files):
+    """构造一次 list_dir 的真实返回：工作区根目录下的条目清单。"""
+    entries = sorted(mta_files) + ["mta_archives/", "node_modules/", "package.json", "srv/", "ui/"]
+    return "\n".join(entries)
+
+
+def call_sequence_messages(system_prompt, user_text, calls,
+                           final_text=None, include_results=True):
+    """把 [(旁白, 工具名, 参数, 工具返回), ...] 拼成标准消息序列。
+
+    final_text 传 None 表示不监督收尾文本；include_results=False 表示连工具返回也省略，
+    此时序列停在「assistant 发出调用」上 —— 这正是冷启动样本要监督的形态
+    （最后一条必须是 assistant，否则模型没有监督目标，自检会直接拦下）。
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text},
+    ]
+    for narration, tool, args, result in calls:
+        call = make_call(narration, tool, args)
+        messages.append(call)
+        if include_results:
+            messages.append(make_result(call, result, tool))
+    if final_text is not None:
+        messages.append({"role": "assistant", "content": final_text})
+    return messages
+
+
+def workspaces_by_rule():
+    """按工作区聚合规则：list_dir / lint 这类请求面向整个工作区，与具体项目无关。"""
+    grouped = {}
+    for rule in RULES:
+        grouped.setdefault(rule["workspace"], []).append(rule)
+    return grouped
+
+
+def build_explore_samples():
+    """工程探查样本：覆盖 list_dir / search_content / read_lints。"""
+    pool = []
+    codebuddy = next(p for p in TOOL_PROFILES if p["id"] == "codebuddy")
+
+    for ws, rules in workspaces_by_rule().items():
+        root = project_root(rules[0])
+        mta_files = sorted({r["mta"] for r in rules})
+        listing = make_dir_listing(mta_files)
+
+        items = [
+            {
+                "users": [
+                    f"{ws} 工作区项目根目录下都有哪些文件？",
+                    f"列一下 {ws} 工作区的项目文件，我确认下 mta 配置在不在根目录",
+                    f"{ws} 这个项目里有什么？mta 配置文件放在哪一层？",
+                ],
+                "calls": [("先看一下项目根目录的结构：", "list_dir",
+                           {"target_directory": root}, listing)],
+                "final": (f"根目录共 {len(listing.splitlines())} 个条目，"
+                          + "、".join(f"`{m}`" for m in mta_files)
+                          + " 都在根目录下；另有 `srv/`、`ui/` 两个模块目录，"
+                            "以及上次构建留下的 `mta_archives/`。"),
+            },
+            {
+                "users": [
+                    f"在 {ws} 工作区里搜一下所有 mta 配置的 `_schema-version`",
+                    f"看一下 {ws} 的 mta 配置 schema 版本是不是一致的",
+                ],
+                "calls": [("逐个确认 mta 配置的 schema 版本声明：", "search_content",
+                           {"pattern": "_schema-version", "path": root, "glob": "mta*.yaml"},
+                           "\n".join(f"{m}:1:_schema-version: '3.1'" for m in mta_files))],
+                "final": (f"命中 {len(mta_files)} 处，{len(mta_files)} 份 mta 配置的 "
+                          "`_schema-version` 都是 `3.1`，版本一致。"),
+            },
+            {
+                "users": [
+                    f"{ws} 工作区里哪些文件引用了 `mta_archives`？",
+                    f"搜一下 {ws} 工作区里 `mta_archives` 的引用位置",
+                ],
+                "calls": [("搜一下哪些脚本引用了 mta_archives：", "search_content",
+                           {"pattern": "mta_archives", "path": root},
+                           'srv/package.json:9:    "deploy": "cf deploy mta_archives/*.mtar",')],
+                "final": ("只有 `srv/package.json` 的 deploy 脚本引用了 `mta_archives`，"
+                          "其余位置没有硬编码归档路径。"),
+            },
+            {
+                "users": [
+                    f"检查一下 {ws} 工作区现在的 lint 情况",
+                    f"{ws} 工作区有 lint 报错吗？",
+                ],
+                "calls": [("读取当前工作区的 lint 诊断：", "read_lints",
+                           {"paths": [root]}, "No lint errors")],
+                "final": "当前工作区没有 lint 报错，`srv/` 和 `ui/` 两个模块都是干净的。",
+            },
+            {
+                "users": [
+                    f"{ws} 工作区的 lint 有哪些问题需要修？",
+                    f"跑一遍 {ws} 的 lint，把问题列出来",
+                ],
+                "calls": [("读取当前工作区的 lint 诊断（只看 error / warning）：", "read_lints",
+                           {"paths": [root], "severity": ["error", "warning"]},
+                           "srv/service.js:42: 'deploy' is defined but never used (no-unused-vars)\n"
+                           "srv/service.js:57: Missing semicolon (semi)")],
+                "final": ("发现 2 处，都在 `srv/service.js`：第 42 行有个未使用的 `deploy` 变量、"
+                          "第 57 行缺分号，都是 warning 级，不影响 `mbt build`。"),
+            },
+        ]
+
+        for item_index, item in enumerate(items):
+            for phrase_index, user_text in enumerate(item["users"]):
+                system_prompt = pick_system_prompt(codebuddy)
+                # flow: 工具结果 + 解读收尾；cold: 序列停在「首轮直接发出调用」上
+                pool.append((f"EXPLORE|{ws}",
+                             f"explore|{ws}|{item_index}|{phrase_index}|flow",
+                             {"tools": make_tools_list(codebuddy),
+                              "messages": call_sequence_messages(
+                                  system_prompt, user_text, item["calls"], item["final"])}))
+                pool.append((f"EXPLORE|{ws}",
+                             f"explore|{ws}|{item_index}|{phrase_index}|cold",
+                             {"tools": make_tools_list(codebuddy),
+                              "messages": call_sequence_messages(
+                                  system_prompt, user_text, item["calls"],
+                                  final_text=None, include_results=False)}))
+
+    return pool
+
+
+def build_edit_samples():
+    """文件编辑样本：覆盖 replace_in_file（先 read_file 看清现状，再做精确替换）。"""
+    pool = []
+    codebuddy = next(p for p in TOOL_PROFILES if p["id"] == "codebuddy")
+
+    for ws, rules in workspaces_by_rule().items():
+        root = project_root(rules[0])
+        mta_yaml = f"{root}\\mta.yaml"
+
+        for rule in rules:
+            content = make_mta_content(rule["project"])
+            new_version = rng.choice(["1.1.0", "2.0.0", "2.1.0"])
+
+            items = [
+                {
+                    "users": [
+                        f"把根目录 mta.yaml 的 version 升级到 {new_version}，其他内容别动",
+                        f"mta.yaml 里的版本号改成 {new_version}",
+                    ],
+                    "old": "version: 1.0.0",
+                    "new": f"version: {new_version}",
+                    "final": f"`mta.yaml` 的 version 已从 `1.0.0` 改为 `{new_version}`，其余内容未改动。",
+                },
+                {
+                    "users": [
+                        "根目录 mta.yaml 的 _schema-version 升到 3.2",
+                        "把 mta.yaml 的 _schema-version 改成 3.2",
+                    ],
+                    "old": "_schema-version: '3.1'",
+                    "new": "_schema-version: '3.2'",
+                    "final": "`mta.yaml` 的 `_schema-version` 已改为 `3.2`，描述符结构没有其它变化。",
+                },
+                {
+                    "users": [
+                        "把 mta.yaml 的 enable-parallel-deployments 关掉",
+                        "mta.yaml 里把并行部署改成 false（enable-parallel-deployments）",
+                    ],
+                    "old": "enable-parallel-deployments: true",
+                    "new": "enable-parallel-deployments: false",
+                    "final": "`mta.yaml` 的 `enable-parallel-deployments` 已置为 `false`，部署会改为串行执行。",
+                },
+            ]
+
+            for item_index, item in enumerate(items):
+                for phrase_index, user_text in enumerate(item["users"]):
+                    calls = [
+                        ("先读取 `mta.yaml` 确认当前内容：", "read_file",
+                         {"filePath": mta_yaml}, content),
+                        (f"定位到 `{item['old']}`，做精确替换：", "replace_in_file",
+                         {"filePath": mta_yaml, "old_str": item["old"], "new_str": item["new"]}, ""),
+                    ]
+                    pool.append((f"EDIT|{ws}",
+                                 f"edit|{ws}|{rule['project']}|{item_index}|{phrase_index}",
+                                 {"tools": make_tools_list(codebuddy),
+                                  "messages": call_sequence_messages(
+                                      pick_system_prompt(codebuddy), user_text, calls,
+                                      item["final"])}))
+
+    return pool
+
+
+# ============================================================
+# 9. 知识库问答样本（不触发 tool_call）
 # ============================================================
 
 def build_qa_samples():
@@ -1263,7 +1527,7 @@ def build_qa_samples():
 
 
 # ============================================================
-# 9. 按分组切分（杜绝同一条轨迹跨 train / val）
+# 10. 按分组切分（杜绝同一条轨迹跨 train / val）
 # ============================================================
 
 def split_by_group(pool, val_ratio=0.15):
@@ -1301,7 +1565,7 @@ def split_by_group(pool, val_ratio=0.15):
 
 
 # ============================================================
-# 10. 生成后自检
+# 11. 生成后自检
 # ============================================================
 # 这一节检查的都是「会静默毁掉训练」的坑：工具名不在菜单里、必填参数缺失、
 # 参数未在 schema 里声明、tool 结果与调用配对错位、同组内工具签名不一致。
@@ -1388,6 +1652,43 @@ def validate_group_consistency(pool):
     return issues
 
 
+def count_used_tools(rows):
+    """按样本统计「真正发出过调用」的工具（同一条样本里同一工具多次只计一次）。"""
+    counts = defaultdict(int)
+    for row in rows:
+        used = {tc["function"]["name"]
+                for m in row["messages"]
+                for tc in (m.get("tool_calls") or [])}
+        for name in used:
+            counts[name] += 1
+    return counts
+
+
+def validate_tool_coverage(rows, label, min_samples=MIN_TOOL_COVERAGE):
+    """agent 提示词里声明的每条工具，都必须有足够多的真实调用样本。
+
+    这里以 CodeBuddy 档位的工具菜单为准 —— 那正是线上 agent 注入的提示词。
+    覆盖不足说明「有 schema、没示范」，模型只能猜参数怎么填，
+    到了真实环境就只会硬凑 shell 命令（这正是 read_file/replace_in_file 的线上表现）。
+    """
+    menu = [t["function"]["name"] for t in CODEBUDDY_TOOL_MENU]
+    counts = count_used_tools(rows)
+
+    issues = []
+    print(f"\n[{label}] 工具覆盖自检（菜单 {len(menu)} 条，阈值 {min_samples} 条样本）:")
+    for name in menu:
+        got = counts.get(name, 0)
+        mark = "OK" if got >= min_samples else "!!"
+        print(f"    [{mark}] {name:<20} {got:5d} 条样本发出过调用")
+        if got < min_samples:
+            issues.append(f"[{label}] 工具 {name} 只有 {got} 条调用样本（要求 ≥ {min_samples}）")
+
+    others = {k: v for k, v in sorted(counts.items(), key=lambda kv: -kv[1]) if k not in set(menu)}
+    if others:
+        print(f"    其它档位工具: {others}")
+    return issues
+
+
 def estimate_tokens(text):
     """粗略估算 token 数（中文 1 token/字，其余 0.3 token/字符）。
     真实值以 main.py 里 tokenizer 实测为准，这里只用来快速发现异常长的样本。"""
@@ -1466,6 +1767,9 @@ def run_post_generation_checks(train_data, val_data, train_file, val_file, pool)
     issues += validate_tool_calls(reloaded_train, "train")
     issues += validate_tool_calls(reloaded_val, "val")
     issues += validate_group_consistency(pool)
+    # agent 提示词里声明的每条工具都必须有示范：train 用阈值卡死，val 只打印（组切分后条数天然少）
+    issues += validate_tool_coverage(reloaded_train, "train")
+    validate_tool_coverage(reloaded_val, "val", min_samples=0)
 
     rows = reloaded_train + reloaded_val
     print(f"回读样本总数: {len(rows)}  (train {len(reloaded_train)} / val {len(reloaded_val)})")
@@ -1486,13 +1790,15 @@ def run_post_generation_checks(train_data, val_data, train_file, val_file, pool)
 
 
 # ============================================================
-# 11. 入口
+# 12. 入口
 # ============================================================
 
 def generate_dataset():
     chain_pool = build_deploy_chain_samples()
     login_pool = build_login_action_samples()
     devops_pool = build_devops_action_samples()
+    explore_pool = build_explore_samples()
+    edit_pool = build_edit_samples()
     qa_pool = build_qa_samples()
 
     print("原始生成:")
@@ -1500,9 +1806,11 @@ def generate_dataset():
           f"({len({gid for _, gid, _ in chain_pool})} 个轨迹组)")
     print(f"  - 登录 Action 样本: {len(login_pool)} 条")
     print(f"  - DevOps 单步动作样本: {len(devops_pool)} 条")
+    print(f"  - 工程探查样本（list_dir/search_content/read_lints）: {len(explore_pool)} 条")
+    print(f"  - 文件编辑样本（read_file/replace_in_file）: {len(edit_pool)} 条")
     print(f"  - 知识库问答样本: {len(qa_pool)} 条")
 
-    all_pool = chain_pool + login_pool + devops_pool + qa_pool
+    all_pool = chain_pool + login_pool + devops_pool + explore_pool + edit_pool + qa_pool
     all_gids = {gid for _, gid, _ in all_pool}
     train_data, val_data, train_gids, val_gids = split_by_group(all_pool)
 
@@ -1543,10 +1851,15 @@ def generate_dataset():
         print(f"        {p['id']:>18s}  权重 {p['weight']:<2d}  工具 {len(p['tools'])} 条"
               f"  命令工具名 `{shell_tool_name(p)}`")
     print("        改权重只需调整 TOOL_PROFILES 里的 weight。")
-    print("[提醒] 每步要执行的命令（Invoke-RestMethod / 查找并复制 mta / mbt build / "
+    print("[提醒] 每步要执行的命令（Invoke-RestMethod / 查找并写入 mta / mbt build / "
           "cf deploy / Remove-Item）在所有档位里是恒定的 —— 那才是要学的技能。")
-    print("[提醒] 「复制 mta」按档位展开：CodeBuddy 用 search_file 定位 -> execute_command 执行 Copy-Item，"
+    print("[提醒] 「复制 mta」按档位展开：CodeBuddy 走 SOP 原生三步 "
+          "search_file 定位 -> read_file 读内容 -> write_to_file 写 mta.yaml；"
           "其余档位用一条 Get-ChildItem 递归查找 + Copy-Item 命令（mta 文件可能在 mta/ 子目录）。")
+    print("[提醒] 清理同样按档位展开：CodeBuddy 用 delete_file 删 mta.yaml + "
+          "execute_command 删目录与构建产物。")
+    print(f"[提醒] 覆盖自检要求 agent 菜单里 9 条工具每条至少有 {MIN_TOOL_COVERAGE} 条调用样本；"
+          "不足会被自检拦下（见 validate_tool_coverage）。")
     print("[提醒] CodeBuddy 的 execute_command 没有 timeout 参数，"
           "超时要求靠助手旁白表达；Bash 档位则会带 timeout=600000（毫秒）。")
 
