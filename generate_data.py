@@ -535,10 +535,10 @@ def make_chain_mtar(rule):
 
 
 def make_build_log(archive_path):
-    """构造一段真实感的 `mbt build` 输出（20 行左右）。
+    """构造 `mbt build` 尾部输出（截取最后 10 行）。
 
-    归档行被埋在日志靠后的位置（落在「最后 10 行」之内），前面全是构建噪声，
-    这样模型必须真的去扫日志尾部，而不是读第一行或凭记忆编一个路径。
+    归档行落在「最后 10 行」之内，配合 Select-Object -Last 10，
+    确保返回给模型的内容只有尾部 10 行，防止撑爆上下文。
     """
     lines = [
         "[10:12:01] INFO validating the MTA project",
@@ -563,7 +563,7 @@ def make_build_log(archive_path):
         "[10:14:30] INFO cleaning temporary files",
         "[10:14:31] INFO build succeeded",
     ]
-    return "\n".join(lines)
+    return "\n".join(lines[-10:])
 
 
 STEP_ORDER = ["login", "copy", "build", "deploy", "clean"]
@@ -661,7 +661,7 @@ def build_trajectory_group(rule, env_str, system_prompt, user_prompt, group_id, 
         "pre": shell_call(
             "`mta.yaml` 已就绪。接下来在项目根目录执行 `mbt build` 打包构建"
             "（超时 600 秒，非交互模式，需等待命令完整返回）：",
-            "mbt build", False, "构建 MTA 项目", True),
+            "mbt build 2>&1 | Select-Object -Last 10", False, "构建 MTA 项目", True),
         "ok": make_build_log(mtar_log),
         "fail": ("[INFO] validating the MTA project\n"
                  "[ERROR] the MTA project is not valid\n"
@@ -976,7 +976,7 @@ def build_devops_action_samples():
             actions.append({
                 "kind": "shell", "user": q,
                 "pre": "正在执行 `mbt build` 进行项目构建打包：",
-                "cmd": "mbt build", "approval": False,
+                "cmd": "mbt build 2>&1 | Select-Object -Last 10", "approval": False,
                 "desc": "构建 MTA 项目", "long": True,
                 "result": make_build_log(mtar_path),
                 "final": f"MTA 构建完成，构建日志末尾显示归档包为 `{mtar_path}`。",
