@@ -91,6 +91,7 @@ def make_sft_config():
         ddp_find_unused_parameters=False,                       # 核心修复 2：DDP 显式关闭未用参数查找，杜绝 flow control 报错与额外显存缓冲
         learning_rate=1.5e-4,        # 4B 模型 LoRA 调优为 1.5e-4，平滑梯度收敛
         fp16=True,                   # T4(Turing) 不支持 bf16，继续用 fp16 + GradScaler
+        optim="paged_adamw_8bit" if torch.cuda.is_available() else "adamw_torch",
         lr_scheduler_type="cosine",
         warmup_steps=10,
         max_grad_norm=1.0,
@@ -160,14 +161,17 @@ def main():
         print(f"训练集 {len(data_dict['train'])} 条 / 验证集 {len(data_dict['val'])} 条")
         check_max_length(data_dict["train"], tokenizer, MAX_LENGTH)
 
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device_map = {"": local_rank} if torch.cuda.is_available() else None
+
     model_kwargs: dict[str, Any] = {
         "torch_dtype": torch.float16,
         "attn_implementation": "sdpa",
     }
 
-    # 支持可选的 4-bit QLoRA 模式：在显存极度紧张的 15GB T4 GPU 下，
-    # 开启环境变量 USE_4BIT=1 可将 4B 基座显存从 ~8GB 压至 ~2.4GB
-    use_4bit = os.environ.get("USE_4BIT", "0").lower() in ("1", "true", "yes")
+    # 默认启用 4-bit QLoRA 模式（彻底解决 15GB T4 GPU 下的 OOM 问题）
+    # 4-bit NF4 量化后 4B 基座显存从 ~8GB 压降至 ~2.2GB，留足 10GB+ 显存余量供反向传播
+    use_4bit = os.environ.get("USE_4BIT", "1").lower() in ("1", "true", "yes")
     if use_4bit:
         try:
             from transformers import BitsAndBytesConfig
@@ -177,11 +181,13 @@ def main():
                 bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True,
             )
+            if device_map is not None:
+                model_kwargs["device_map"] = device_map
             if is_main_process:
-                print("[量化] 已启用 4-bit QLoRA 模式，基座模型显存将从 ~8GB 降至 ~2.4GB")
+                print(f"[量化] 已默认启用 4-bit QLoRA 模式，基座显存压降至 ~2.2GB (device_map={device_map})")
         except ImportError:
             if is_main_process:
-                print("[警告] 未安装 bitsandbytes，回退至 FP16 模式")
+                print("[警告] 未检测到 bitsandbytes，回退至 FP16 模式")
 
     try:
         model = AutoModelForCausalLM.from_pretrained(
@@ -201,7 +207,11 @@ def main():
 
     if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
         from peft import prepare_model_for_kbit_training
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
 
     sft_config = make_sft_config()
 
