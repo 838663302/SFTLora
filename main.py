@@ -78,9 +78,13 @@ def check_precision(model):
     """
     print("=" * 64)
     all_dtypes = sorted({str(p.dtype) for p in model.parameters()})
-    trainable = [(name, param.dtype) for name, param in model.named_parameters() if param.requires_grad]
+    named = list(model.named_parameters())
+    trainable = [(name, param.dtype) for name, param in named if param.requires_grad]
+    frozen = [(name, param.dtype) for name, param in named if not param.requires_grad]
     print(f"[精度自检] 模型参数 dtype: {all_dtypes}")
     print(f"[精度自检] 可训练参数 {len(trainable)} 个，dtype: {sorted({str(d) for _, d in trainable})}")
+    # 冻结侧残留 16-bit 说明基座未量化部分没被上转 fp32，T4 上会走 bf16 模拟、白白变慢
+    print(f"[精度自检] 冻结参数 {len(frozen)} 个，dtype: {sorted({str(d) for _, d in frozen})}")
 
     risky = [name for name, dtype in trainable if dtype in (torch.float16, torch.bfloat16)]
     if risky:
@@ -238,8 +242,18 @@ def main():
         processing_class = tokenizer,
     )
 
-    # 必须在 Trainer 挂好 LoRA 之后再看：PeftModel 一旦把适配器转成 fp16/bf16，
-    # fp16 AMP 的 GradScaler 就会在第一次梯度裁剪时崩掉，这里提前把 dtype 打出来。
+    # 关键修复：peft 会把 adapter 权重对齐成基座的 dtype，而 Qwen3 的 checkpoint 本身是 bf16，
+    # 于是 lora_A / lora_B 也变成 bf16 —— 这一点不受 from_pretrained 的 dtype、也不受
+    # bnb_4bit_compute_dtype 控制。而 fp16 AMP 的 GradScaler 只接受 fp32 梯度：bf16 会抛
+    # `_amp_foreach_non_finite_check_and_unscale_cuda not implemented for 'BFloat16'`，
+    # fp16 会抛 `Attempting to unscale FP16 gradients`，两者都必崩。
+    # 因此在 optimizer 建好之前（trainer.train() 内部才建）显式归一成 fp32，
+    # 做法见 peft 官方 troubleshooting；只动可训练参数，4-bit 基座原样不动。
+    for param in trainer.model.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.float32)
+
+    # 打完桩再自检一次：可训练参数 dtype 必须只有 torch.float32。
     if is_main_process:
         check_precision(trainer.model)
 
