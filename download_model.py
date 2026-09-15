@@ -48,7 +48,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def main():
-    model_name = getattr(config, "BASE_MODEL_NAME", "Qwen/Qwen3-4B")
+    model_name = getattr(config, "BASE_MODEL_NAME", "Qwen/Qwen3-8B")
     print("=" * 64)
     print(f"正在预下载基座模型: {model_name}")
     print("已启用全局 SSL 证书免校验（彻底兼容企业代理、VPN 与安全拦截网关）")

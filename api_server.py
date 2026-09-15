@@ -29,7 +29,8 @@ app.add_middleware(
 model = None
 tokenizer = None
 current_device = "GPU"
-MODEL_PATH = r"C:\Users\azt1szh\Desktop\set\checkpoints\ov_model"
+# 默认指向微调好的 4B OpenVINO 模型目录，支持环境变量 OV_MODEL_PATH 覆盖
+MODEL_PATH = os.environ.get("OV_MODEL_PATH", r"C:\Users\azt1szh\Desktop\set\checkpoints\ov_model")
 
 
 def load_train_tool_names() -> set:
@@ -78,7 +79,8 @@ def load_model(device: str = "GPU"):
     ov_config = {
         "PERFORMANCE_HINT": "LATENCY",
         "GPU_ENABLE_LARGE_ALLOCATIONS": "YES",
-        "KV_CACHE_PRECISION": "u8"
+        "KV_CACHE_PRECISION": "u8",
+        "CACHE_DIR": os.path.join(MODEL_PATH, "ov_cache"),
     } if current_device == "GPU" else {"PERFORMANCE_HINT": "LATENCY"}
 
     try:

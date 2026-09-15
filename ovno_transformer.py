@@ -4,10 +4,13 @@ os.environ["HF_HUB_DISABLE_XET"] = "1"
 from optimum.intel.openvino import OVModelForCausalLM, OVWeightQuantizationConfig
 from transformers import AutoTokenizer
 
-# 模型源：微调后合并的完整模型目录
+# 模型源：
+# 1. 刚下载的 Qwen3-8B 官方基座模型快照
+QWEN3_8B_DIR = Path(r"C:\Users\azt1szh\.cache\huggingface\hub\models--Qwen--Qwen3-8B\snapshots\b968826d9c46dd6066d109eabc6255188de91218")
+# 2. 微调后合并的完整模型目录（备用）
 MERGED_DIR = Path(r"C:\Users\azt1szh\Desktop\set\SFTLora\checkpoints\merged")
 
-# 使用微调后合并的完整模型目录作为输入源
+# 使用微调后合并的 4B 模型作为输入源
 input_dir = MERGED_DIR
 output_dir = Path(r"C:\Users\azt1szh\Desktop\set\checkpoints\ov_model")
 
@@ -40,9 +43,16 @@ tokenizer.save_pretrained(output_dir)
 
 print(f"\n转换完成！模型已保存在: {output_dir}")
 
-# 3. 快速推理验证测试
-print("\n正在验证加载 OpenVINO 模型并进行生成测试...")
-ov_test_model = OVModelForCausalLM.from_pretrained(output_dir, device="CPU")
+# 3. 快速推理验证测试（使用 Intel Arc 核显 GPU）
+print("\n正在验证加载 OpenVINO 模型并使用 Intel Arc GPU 进行生成测试...")
+ov_test_model = OVModelForCausalLM.from_pretrained(
+    output_dir,
+    device="GPU",
+    ov_config={
+        "PERFORMANCE_HINT": "LATENCY",
+        "CACHE_DIR": str(output_dir / "ov_cache"),
+    },
+)
 test_prompt = "你好，请介绍一下你自己。"
 inputs = tokenizer(test_prompt, return_tensors="pt")
 outputs = ov_test_model.generate(**inputs, max_new_tokens=30)
