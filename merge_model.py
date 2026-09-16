@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def main():
-    model_name = getattr(config, "BASE_MODEL_NAME", "Qwen/Qwen3-4B")
+    model_name = getattr(config, "BASE_MODEL_NAME", "Qwen/Qwen3-8B")
 
     try:
         base_model = AutoModelForCausalLM.from_pretrained(

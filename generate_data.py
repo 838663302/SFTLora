@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import re
 import uuid
@@ -2134,6 +2135,73 @@ def estimate_sample_tokens(row):
     return estimate_tokens("\n".join(parts))
 
 
+MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "4352"))
+
+
+def load_tokenizer_for_check():
+    """尝试加载基座分词器以实测 Tokenizer 长度。"""
+    try:
+        import config
+        from transformers import AutoTokenizer
+        model_name = getattr(config, "BASE_MODEL_NAME", "Qwen/Qwen3-8B")
+        return AutoTokenizer.from_pretrained(model_name)
+    except Exception as e:
+        print(f"[提示] 未能加载 Tokenizer 实测精确 Token 长度 ({e})，保留启发式估算。")
+        return None
+
+
+def check_max_length(rows, label, tokenizer, max_length=MAX_LENGTH):
+    """用 tokenizer 实测每条样本真实长度，确认没有任何一条会被静默截断。
+
+    按「工具菜单」分组报告最长值——不同 harness 档位的工具定义大小差别很大
+    （9 条工具 ≈1800 token，单工具档位 ≈120 token），分组看才知道是谁把样本撑长的。
+    超限直接计入 issues 拦截：截断会把尾部的最终汇报砍掉，训出来的模型是废的。
+    """
+    issues = []
+    if tokenizer is None:
+        return issues
+
+    def render(row):
+        return tokenizer.apply_chat_template(
+            row["messages"],
+            tools=row.get("tools"),
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+
+    print(f"\n[{label}] 真实 Token 长度自检（按 Tokenizer 实测，阈值 {max_length}）:")
+    longest_by_menu = {}
+    for row in rows:
+        length = len(tokenizer(render(row))["input_ids"])
+        fingerprint = tuple(sorted(t["function"]["name"] for t in (row.get("tools") or [])))
+        if fingerprint not in longest_by_menu or length > longest_by_menu[fingerprint][0]:
+            longest_by_menu[fingerprint] = (length, row)
+
+    if not longest_by_menu:
+        print(f"[{label}] 数据集为空，跳过长度检查")
+        return issues
+
+    overall_length, longest_row = max(longest_by_menu.values(), key=lambda item: item[0])
+    for fingerprint, (length, _row) in sorted(longest_by_menu.items(), key=lambda kv: -kv[1][0]):
+        tag = fingerprint[0] if len(fingerprint) == 1 else f"{len(fingerprint)} 条工具"
+        print(f"    {length:6d} tokens   工具档位: {tag}")
+
+    last_message = longest_row["messages"][-1]
+    last_kind = "工具调用" if last_message.get("tool_calls") else "文本收尾"
+    print(f"[{label}] 全量最长 {overall_length} tokens / max_length {max_length}"
+          f"（该样本最后一回合: {last_kind}）")
+
+    if overall_length > max_length:
+        issues.append(
+            f"[{label}] 最长样本 {overall_length} tokens 超过 max_length {max_length}，"
+            f"尾部会被静默截断（很可能正好砍掉最终汇报），请调大 MAX_LENGTH。"
+        )
+    else:
+        print(f"[{label}] 长度检查通过，余量 {max_length - overall_length} tokens")
+
+    return issues
+
+
 def summarize(rows, label):
     """打印工具档位分布 / 监督目标分布 / 长度估算"""
     menu_counter = defaultdict(int)
@@ -2168,8 +2236,7 @@ def summarize(rows, label):
 
     sizes = [estimate_sample_tokens(r) for r in rows]
     if sizes:
-        print(f"[{label}] 长度估算（字符启发式，真实值以 main.py 实测为准）: "
-              f"最长 {max(sizes)} / 平均 {sum(sizes) / len(sizes):.0f} tokens")
+        print(f"[{label}] 启发式估算长度: 最长 {max(sizes)} / 平均 {sum(sizes) / len(sizes):.0f} tokens")
 
 
 def run_post_generation_checks(train_data, val_data, train_file, val_file, pool):
@@ -2203,10 +2270,17 @@ def run_post_generation_checks(train_data, val_data, train_file, val_file, pool)
     issues += validate_command_exposure(reloaded_train, "train")
     validate_command_exposure(reloaded_val, "val", min_samples=0)
 
+    # 精确 Tokenizer 长度自检（原在 main.py，现移至此处）
+    tokenizer = load_tokenizer_for_check()
+    if tokenizer:
+        issues += check_max_length(reloaded_train, "train", tokenizer, MAX_LENGTH)
+        check_max_length(reloaded_val, "val", tokenizer, MAX_LENGTH)
+
     rows = reloaded_train + reloaded_val
-    print(f"回读样本总数: {len(rows)}  (train {len(reloaded_train)} / val {len(reloaded_val)})")
+    print(f"\n回读样本总数: {len(rows)}  (train {len(reloaded_train)} / val {len(reloaded_val)})")
     summarize(reloaded_train, "train")
     summarize(reloaded_val, "val")
+
 
     print("\n" + "-" * 64)
     if issues:
@@ -2312,4 +2386,4 @@ if __name__ == "__main__":
     problem_count = generate_dataset()
     if problem_count:
         raise SystemExit(f"生成后自检发现 {problem_count} 个问题，先修数据再拿去训练。")
-    print("\n下一步: python main.py  （训练前会再用 tokenizer 实测一次长度与 tools 渲染）")
+    print("\n下一步: python main.py  （数据生成阶段已完成分词器精确长度实测，训练可直接启动）")

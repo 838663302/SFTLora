@@ -105,15 +105,30 @@ def load_model(device: str = "GPU"):
 
 def robust_parse_tool_call(m: str):
     """容错解析可能带有未转义引号的脏 JSON 工具调用"""
+    tool_name = ""
     try:
         call_json = json.loads(m.strip())
-        return call_json.get("name", ""), call_json.get("arguments", {})
+        tool_name = call_json.get("name", "")
+        if tool_name != "Invoke-RestMethod":
+            return tool_name, call_json.get("arguments", {})
     except Exception:
         pass
 
     # 正则提取 name
-    name_match = re.search(r'"name"\s*:\s*"([^"]+)"', m)
-    tool_name = name_match.group(1) if name_match else ""
+    if not tool_name:
+        name_match = re.search(r'"name"\s*:\s*"([^"]+)"', m)
+        tool_name = name_match.group(1) if name_match else ""
+
+    # 针对模型幻觉：将命令行直接当成 tool_name 的情况自动修复为 execute_command
+    if tool_name == "Invoke-RestMethod":
+        # 从原始匹配串或参数中还原出标准的 PowerShell 登录命令
+        code_match = re.search(r"['\"]?16[23]-d-[a-z]+['\"]?", m)
+        space_code = code_match.group(0).strip("'\"") if code_match else "162-d-pt"
+        repaired_cmd = (
+            f"Invoke-RestMethod -Uri http://localhost:3000/space/login -Method Post "
+            f"-ContentType application/json -Body (@{{space='{space_code}'}}|ConvertTo-Json)"
+        )
+        return "execute_command", {"command": repaired_cmd, "requires_approval": True}
 
     # 特别针对 execute_command 的命令字符串修复（解决 powershell 引号嵌套冲突）
     if tool_name == "execute_command":

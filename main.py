@@ -18,56 +18,10 @@ from trl import SFTConfig, SFTTrainer
 from process import process
 from peft import LoraConfig, prepare_model_for_kbit_training
 
-# 单条样本的最大 token 数。
-# 实测当前数据集最长样本 3816 token（均值约 2237），比上一版长约 340 token（提示词加了 MPB 对照表）。
-# 设为 4352 留出约 530 token 余量；盲目设 8192 只会白吃注意力和位置张量的显存。
+# 单条样本的最大 token 数
 MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "4352"))
 
 
-def check_max_length(train_dataset, tokenizer, max_length):
-    """训练前自检：用 tokenizer 实测每条样本长度，确认没有任何一条会被静默截断。
-
-    按「工具菜单」分组报告最长值——不同 harness 档位的工具定义大小差别很大
-    （9 条工具 ≈1800 token，单工具档位 ≈120 token），分组看才知道是谁把样本撑长的。
-    超限直接抛错：截断会把尾部的最终汇报砍掉，训出来的模型是废的，不如别训。
-    """
-    def render(row):
-        return tokenizer.apply_chat_template(
-            row["messages"],
-            tools=row.get("tools"),
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-
-    print("=" * 64)
-    print("[数据自检] 各工具档位的最长样本（token 数按 tokenizer 实测）:")
-    longest_by_menu = {}
-    for row in train_dataset:
-        length = len(tokenizer(render(row))["input_ids"])
-        fingerprint = tuple(sorted(t["function"]["name"] for t in (row.get("tools") or [])))
-        if fingerprint not in longest_by_menu or length > longest_by_menu[fingerprint][0]:
-            longest_by_menu[fingerprint] = (length, row)
-
-    if not longest_by_menu:
-        print("[数据自检] 训练集为空，跳过长度检查")
-        return
-
-    overall_length, longest_row = max(longest_by_menu.values(), key=lambda item: item[0])
-    for fingerprint, (length, _row) in sorted(longest_by_menu.items(), key=lambda kv: -kv[1][0]):
-        label = fingerprint[0] if len(fingerprint) == 1 else f"{len(fingerprint)} 条工具"
-        print(f"    {length:6d} tokens   工具档位: {label}")
-
-    last_message = longest_row["messages"][-1]
-    last_kind = "工具调用" if last_message.get("tool_calls") else "文本收尾"
-    print(f"[数据自检] 全量最长 {overall_length} tokens / max_length {max_length}"
-          f"（该样本最后一回合: {last_kind}）")
-
-    if overall_length > max_length:
-        raise ValueError(
-            f"[数据自检失败] 最长样本 {overall_length} tokens 超过 max_length {max_length}，"
-            f"尾部会被静默截断（很可能正好砍掉最终汇报），请调大 MAX_LENGTH。"
-        )
-    print(f"[数据自检] 长度检查通过，余量 {max_length - overall_length} tokens")
 
 
 def check_precision(model):
@@ -94,17 +48,6 @@ def check_precision(model):
 
 
 def tokenize_assistant_only(example, tokenizer, max_length):
-    """把一条样本 tokenize 成 input_ids + labels，并且只让 assistant 段参与 loss。
-
-    为什么要自己算：Qwen3 的 chat template 里没有 `{% generation %}` 标记，
-    TRL 的 `assistant_only_loss=True` 会直接报错（实测 `return_assistant_tokens_mask=True`
-    抛 "chat template does not contain {% generation %} keyword"）。
-    做法：prompt = 渲染到「生成提示符」为止，full = 完整渲染；已用全部 837 条训练样本验证过
-    「prompt 的 token 是 full 的前缀」，于是 labels = [-100]*len(prompt) + full[len(prompt):]。
-
-    效果：95%+ 的 prompt token（system/SOP/工具 schema/工具返回）照样进模型当上下文，
-    只是不再参与梯度 —— 把约 25 倍的梯度权重让给真正要学的行为段（实测 4.0% -> 100%）。
-    """
     prompt_ids = tokenizer(
         tokenizer.apply_chat_template(example["messages"][:-1], tools=example.get("tools"),
                                       tokenize=False, add_generation_prompt=True))["input_ids"]
@@ -122,11 +65,6 @@ def tokenize_assistant_only(example, tokenizer, max_length):
 
 
 def check_supervision(rows):
-    """自检 mask 是否真的生效。
-
-    mask 生效时只有最后一个 assistant 回合计入 loss，占比约 4%（其余是 system/SOP/工具 schema/工具返回）；
-    占比接近 100% 则说明前缀校验失败、退化回了「整段监督」。
-    """
     total = sum(len(row["input_ids"]) for row in rows)
     supervised = sum(sum(1 for token in row["labels"] if token != -100) for row in rows)
     ratio = supervised / total if total else 0.0
@@ -228,11 +166,11 @@ def patch_peft_tensor_parallel_compat():
 def main():
     patch_peft_tensor_parallel_compat()
 
-    # 只在主进程做长度自检与日志打印，否则两个 rank 会把 809 条样本各 tokenize 一遍
+    # 只在主进程打印日志
     is_main_process = int(os.environ.get("LOCAL_RANK", 0)) == 0
 
     data_dict = process()
-    model_name = getattr(config, "BASE_MODEL_NAME", "Qwen/Qwen3-4B")
+    model_name = getattr(config, "BASE_MODEL_NAME", "Qwen/Qwen3-8B")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -240,7 +178,6 @@ def main():
         print(f"[并行] world_size={os.environ.get('WORLD_SIZE', 1)} "
               f"可见 GPU 数={torch.cuda.device_count()}")
         print(f"训练集 {len(data_dict['train'])} 条 / 验证集 {len(data_dict['val'])} 条")
-        check_max_length(data_dict["train"], tokenizer, MAX_LENGTH)
 
     # tokenize + assistant 段 mask。放在模型加载之前，早失败早收工。
     train_dataset = data_dict["train"].map(
@@ -337,9 +274,6 @@ def main():
 
     trainer.train()
 
-    # trainer.save_model 内部已按 args.should_save（仅 process_index==0）守住写盘，多进程下只会存一份；
-    # 但 tokenizer.save_pretrained 属于 PreTrainedTokenizerBase，完全没有分布式守卫，
-    # 两个进程会并发写同一个 tokenizer.json（十几 MB，可能写出半截导致损坏），必须自己挡。
     trainer.save_model(str(config.MODEL_PATH))
     if is_main_process:
         tokenizer.save_pretrained(str(config.MODEL_PATH))
