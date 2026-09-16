@@ -2,8 +2,12 @@ import inspect
 import os
 from typing import Any
 
-# TPU 环境配置：设置 PJRT 运行时后端为 TPU
-os.environ.setdefault("PJRT_DEVICE", "TPU")
+# TPU 环境配置：仅在存在 torch_xla 环境时设置 PJRT 运行时后端为 TPU
+try:
+    import torch_xla
+    os.environ.setdefault("PJRT_DEVICE", "TPU")
+except ImportError:
+    pass
 os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
