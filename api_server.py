@@ -103,14 +103,125 @@ def load_model(device: str = "GPU"):
     print(f"\n>>> 模型已就绪！成功运行在: [{current_device}] <<<\n")
 
 
+def sanitize_command(cmd: str) -> str:
+    """对模型生成的终端/PowerShell命令行进行深度容错纠错与格式规范化"""
+    if not cmd or not isinstance(cmd, str):
+        return cmd
+
+    repaired = cmd.strip()
+
+    # 1. 修复 PowerShell Cmdlet 与参数黏连（如 Select-Object-Last 10 -> Select-Object -Last 10）
+    # 匹配非空格、非横杠后紧跟的常见 PowerShell 参数名
+    ps_param_pattern = (
+        r'(?<=[^\s\-])-(last|first|destination|path|force|filter|recurse|file|'
+        r'uri|method|contenttype|body|pattern|erroraction|compress|depth|'
+        r'property|expandproperty|passthru|confirm|whatif)\b'
+    )
+    repaired = re.sub(ps_param_pattern, r' -\1', repaired, flags=re.IGNORECASE)
+
+    # 2. 修复 Windows PowerShell 5.1 不支持的 && 语法，替换为 ;
+    if "&&" in repaired and "http" not in repaired:
+        repaired = re.sub(r'\s*&&\s*', ' ; ', repaired)
+
+    # 3. 修复目录 / 路径拼写幻觉（实测多次出现 mta_archures 导致 cf deploy 找不到文件）
+    repaired = re.sub(r'\bmta_arch[a-z0-9_]*\b', 'mta_archives', repaired, flags=re.IGNORECASE)
+
+    # 4. 修复管道符或重定向符附近的常见语法错误
+    repaired = re.sub(r'2>&\|', '2>&1 |', repaired)
+    repaired = re.sub(r'2>&1\|', '2>&1 |', repaired)
+    repaired = re.sub(r'\|\s*tail(?:\s+-n|\s+)?\s*(\d+)', r'| Select-Object -Last \1', repaired, flags=re.IGNORECASE)
+
+    # 5. 针对 mbt build 的专属优化
+    # 真实演示中，mbt build 是核心关键步。模型若带上非法参数（如 -l, --timeout, --local 等），
+    # 或者缺少截断管道导致日志过大，在此统一样式保底。
+    if "mbt build" in repaired:
+        bad_flags = [
+            r'--timeout\s+\d+', r'-l\s+\S+', r'--local', r'-f\b', r'--manifest\b',
+            r'--mta\s+\S+', r'--requirement\b', r'--build\b', r'\bmta\.yaml\b',
+            r'-d\s+\S+'
+        ]
+        mbt_clean = repaired
+        for bf in bad_flags:
+            mbt_clean = re.sub(bf, '', mbt_clean, flags=re.IGNORECASE)
+        mbt_clean = re.sub(r'\s+', ' ', mbt_clean).strip()
+
+        if "Select-String" in mbt_clean or "the MTA archive generated at:" in mbt_clean:
+            repaired = "mbt build 2>&1 | Select-String -Pattern 'the MTA archive generated at:'"
+        else:
+            repaired = "mbt build 2>&1 | Select-Object -Last 10"
+
+    # 6. 针对 cf deploy 的优化（确保带有 -f，防止交互式确认导致超时）
+    if "cf deploy" in repaired:
+        if not re.search(r'\s-f\b', repaired, flags=re.IGNORECASE):
+            repaired = repaired.rstrip(" ;") + " -f"
+
+    return repaired.strip()
+
+
+def sanitize_arguments(tool_name: str, args: dict):
+    """对工具调用的入参做统一清洗校验与智能纠错"""
+    if not isinstance(args, dict):
+        return
+
+    # 1. 修复命令类字段
+    for key in ["command", "cmd", "script"]:
+        if key in args and isinstance(args[key], str):
+            orig_cmd = args[key]
+            cleaned_cmd = sanitize_command(orig_cmd)
+            if cleaned_cmd != orig_cmd:
+                print(f"🔧 [命令自动纠错]: '{orig_cmd}' -> '{cleaned_cmd}'")
+            args[key] = cleaned_cmd
+
+    # 2. 补全或规范化 execute_command 的 requires_approval
+    if tool_name == "execute_command":
+        if "requires_approval" in args:
+            val = args["requires_approval"]
+            if isinstance(val, str):
+                args["requires_approval"] = val.lower() in ("true", "1")
+        else:
+            cmd = args.get("command", "")
+            if any(k in cmd for k in ["Invoke-RestMethod", "cf deploy", "Remove-Item"]):
+                args["requires_approval"] = True
+            else:
+                args["requires_approval"] = False
+
+    # 3. 修复文件路径类字段
+    for path_key in ["filePath", "target_file", "path"]:
+        if path_key in args and isinstance(args[path_key], str):
+            orig_path = args[path_key]
+            cleaned_path = re.sub(r'\bmta_arch[a-z0-9_]*\b', 'mta_archives', orig_path, flags=re.IGNORECASE)
+            cleaned_path = re.sub(r'^[.]+[/\\]+', r'.\\', cleaned_path)
+            if cleaned_path != orig_path:
+                print(f"🔧 [路径自动纠错]: '{orig_path}' -> '{cleaned_path}'")
+            args[path_key] = cleaned_path
+
+
+def sanitize_command_in_text(text: str) -> str:
+    """修复输出给用户的纯文本/Markdown中包含的命令笔误"""
+    if not text:
+        return text
+    text = re.sub(
+        r'(?<=[^\s\-])-(last|first|destination|path|force|filter|recurse|file|'
+        r'uri|method|contenttype|body|pattern|erroraction|compress|depth|'
+        r'property|expandproperty|passthru|confirm|whatif)\b',
+        r' -\1',
+        text,
+        flags=re.IGNORECASE
+    )
+    text = re.sub(r'\bmta_arch[a-z0-9_]*\b', 'mta_archives', text, flags=re.IGNORECASE)
+    return text
+
+
 def robust_parse_tool_call(m: str):
-    """容错解析可能带有未转义引号的脏 JSON 工具调用"""
+    """容错解析可能带有未转义引号的脏 JSON 工具调用，并注入智能容错修复"""
     tool_name = ""
+    arguments = None
+
     try:
         call_json = json.loads(m.strip())
         tool_name = call_json.get("name", "")
         if tool_name != "Invoke-RestMethod":
-            return tool_name, call_json.get("arguments", {})
+            arguments = call_json.get("arguments", {})
     except Exception:
         pass
 
@@ -121,7 +232,6 @@ def robust_parse_tool_call(m: str):
 
     # 针对模型幻觉：将命令行直接当成 tool_name 的情况自动修复为 execute_command
     if tool_name == "Invoke-RestMethod":
-        # 从原始匹配串或参数中还原出标准的 PowerShell 登录命令
         code_match = re.search(r"['\"]?16[23]-d-[a-z]+['\"]?", m)
         space_code = code_match.group(0).strip("'\"") if code_match else "162-d-pt"
         repaired_cmd = (
@@ -131,7 +241,7 @@ def robust_parse_tool_call(m: str):
         return "execute_command", {"command": repaired_cmd, "requires_approval": True}
 
     # 特别针对 execute_command 的命令字符串修复（解决 powershell 引号嵌套冲突）
-    if tool_name == "execute_command":
+    if tool_name == "execute_command" and arguments is None:
         cmd_match = re.search(r'"command"\s*:\s*"(.*?)"\s*,\s*"requires_approval"', m, re.DOTALL)
         if not cmd_match:
             cmd_match = re.search(r'"command"\s*:\s*"(.*)"\s*\}', m, re.DOTALL)
@@ -139,25 +249,39 @@ def robust_parse_tool_call(m: str):
         requires_approval = appr_match.group(1).lower() == 'true' if appr_match else True
         if cmd_match:
             cmd_text = cmd_match.group(1)
-            return tool_name, {"command": cmd_text, "requires_approval": requires_approval}
+            arguments = {"command": cmd_text, "requires_approval": requires_approval}
 
     # 特别针对 write_to_file 的长文本内容提取
-    if tool_name == "write_to_file":
+    if tool_name == "write_to_file" and arguments is None:
         fp_match = re.search(r'"filePath"\s*:\s*"([^"]+)"', m)
         content_match = re.search(r'"content"\s*:\s*"(.*?)"\s*(?:\}\s*\}|\}\s*$|$)', m, re.DOTALL)
         if fp_match:
             c_val = content_match.group(1) if content_match else ""
-            return tool_name, {"filePath": fp_match.group(1), "content": c_val}
+            arguments = {"filePath": fp_match.group(1), "content": c_val}
 
     # 通用 arguments 提取
-    args_match = re.search(r'"arguments"\s*:\s*(\{.*\})', m, re.DOTALL)
-    if args_match:
-        try:
-            return tool_name, json.loads(args_match.group(1))
-        except Exception:
-            return tool_name, {"raw_arguments": args_match.group(1)}
+    if arguments is None:
+        args_match = re.search(r'"arguments"\s*:\s*(\{.*\})', m, re.DOTALL)
+        if args_match:
+            try:
+                arguments = json.loads(args_match.group(1))
+            except Exception:
+                arguments = {"raw_arguments": args_match.group(1)}
+        else:
+            arguments = {}
 
-    return tool_name, {}
+    # 如果 arguments 是字符串（例如被 json 双重转义），尝试再次 loads
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except Exception:
+            pass
+
+    # 深度纠错与优化：对 arguments 进行命令级与路径级智能修正
+    if isinstance(arguments, dict):
+        sanitize_arguments(tool_name, arguments)
+
+    return tool_name, arguments
 
 
 def parse_tool_calls(text: str):
@@ -170,6 +294,13 @@ def parse_tool_calls(text: str):
     pattern = r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)"
     matches = re.findall(pattern, text_clean, re.DOTALL)
     clean_content = re.sub(r"<tool_call>.*", "", text_clean, flags=re.DOTALL).strip()
+
+    # 兼容兜底：如果模型未输出 <tool_call> 标签而是直接输出了合法 JSON 结构
+    if not matches:
+        raw_json_match = re.search(r'(\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:.*?\})', text_clean, re.DOTALL)
+        if raw_json_match:
+            matches = [raw_json_match.group(1)]
+            clean_content = text_clean[:raw_json_match.start()].strip()
 
     for idx, m in enumerate(matches):
         m_str = m.strip()
@@ -195,6 +326,9 @@ def parse_tool_calls(text: str):
 
     for stop in ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]:
         clean_content = clean_content.replace(stop, "").strip()
+
+    # 纯文本内容同步纠错规范化
+    clean_content = sanitize_command_in_text(clean_content)
 
     return clean_content, tool_calls if tool_calls else None
 
