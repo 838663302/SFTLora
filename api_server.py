@@ -32,6 +32,11 @@ current_device = "GPU"
 # 默认指向微调好的 4B OpenVINO 模型目录，支持环境变量 OV_MODEL_PATH 覆盖
 MODEL_PATH = os.environ.get("OV_MODEL_PATH", r"C:\Users\azt1szh\Desktop\set\checkpoints\ov_model")
 
+import config
+
+# 工具调用本地智能纠错开关（仅在 config.py 中配置）
+ENABLE_TOOL_CALL_CORRECTION = getattr(config, "ENABLE_TOOL_CALL_CORRECTION", False)
+
 
 def load_train_tool_names() -> set:
     """动态获取训练集中的所有合法工具名称"""
@@ -212,14 +217,17 @@ def sanitize_command_in_text(text: str) -> str:
     return text
 
 
-def robust_parse_tool_call(m: str):
-    """容错解析可能带有未转义引号的脏 JSON 工具调用，并注入智能容错修复"""
+def robust_parse_tool_call(m: str, enable_correction: bool = ENABLE_TOOL_CALL_CORRECTION):
+    """容错解析可能带有未转义引号的脏 JSON 工具调用，并按需注入智能容错修复"""
     tool_name = ""
     arguments = None
 
     try:
         call_json = json.loads(m.strip())
         tool_name = call_json.get("name", "")
+        # 如果未开启本地纠错，直接原样使用模型给出的 name 和 arguments，不做任何本地修改
+        if not enable_correction:
+            return tool_name, call_json.get("arguments", {})
         if tool_name != "Invoke-RestMethod":
             arguments = call_json.get("arguments", {})
     except Exception:
@@ -230,8 +238,8 @@ def robust_parse_tool_call(m: str):
         name_match = re.search(r'"name"\s*:\s*"([^"]+)"', m)
         tool_name = name_match.group(1) if name_match else ""
 
-    # 针对模型幻觉：将命令行直接当成 tool_name 的情况自动修复为 execute_command
-    if tool_name == "Invoke-RestMethod":
+    # 针对模型幻觉：将命令行直接当成 tool_name 的情况自动修复为 execute_command（仅在开启纠错时）
+    if enable_correction and tool_name == "Invoke-RestMethod":
         code_match = re.search(r"['\"]?16[23]-d-[a-z]+['\"]?", m)
         space_code = code_match.group(0).strip("'\"") if code_match else "162-d-pt"
         repaired_cmd = (
@@ -246,10 +254,12 @@ def robust_parse_tool_call(m: str):
         if not cmd_match:
             cmd_match = re.search(r'"command"\s*:\s*"(.*)"\s*\}', m, re.DOTALL)
         appr_match = re.search(r'"requires_approval"\s*:\s*(true|false)', m, re.IGNORECASE)
-        requires_approval = appr_match.group(1).lower() == 'true' if appr_match else True
+        requires_approval = (appr_match.group(1).lower() == 'true') if appr_match else (True if enable_correction else None)
         if cmd_match:
             cmd_text = cmd_match.group(1)
-            arguments = {"command": cmd_text, "requires_approval": requires_approval}
+            arguments = {"command": cmd_text}
+            if requires_approval is not None:
+                arguments["requires_approval"] = requires_approval
 
     # 特别针对 write_to_file 的长文本内容提取
     if tool_name == "write_to_file" and arguments is None:
@@ -277,14 +287,14 @@ def robust_parse_tool_call(m: str):
         except Exception:
             pass
 
-    # 深度纠错与优化：对 arguments 进行命令级与路径级智能修正
-    if isinstance(arguments, dict):
+    # 深度纠错与优化：对 arguments 进行命令级与路径级智能修正（仅在开启纠错时执行）
+    if enable_correction and isinstance(arguments, dict):
         sanitize_arguments(tool_name, arguments)
 
     return tool_name, arguments
 
 
-def parse_tool_calls(text: str):
+def parse_tool_calls(text: str, enable_correction: bool = ENABLE_TOOL_CALL_CORRECTION):
     """解析 Qwen 文本中的 <tool_call> 标签并转化为 OpenAI 标准 tool_calls 结构"""
     tool_calls = []
     # 移除 think 标签
@@ -295,8 +305,8 @@ def parse_tool_calls(text: str):
     matches = re.findall(pattern, text_clean, re.DOTALL)
     clean_content = re.sub(r"<tool_call>.*", "", text_clean, flags=re.DOTALL).strip()
 
-    # 兼容兜底：如果模型未输出 <tool_call> 标签而是直接输出了合法 JSON 结构
-    if not matches:
+    # 兼容兜底：如果模型未输出 <tool_call> 标签而是直接输出了合法 JSON 结构（仅在开启纠错时兜底）
+    if enable_correction and not matches:
         raw_json_match = re.search(r'(\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:.*?\})', text_clean, re.DOTALL)
         if raw_json_match:
             matches = [raw_json_match.group(1)]
@@ -306,7 +316,7 @@ def parse_tool_calls(text: str):
         m_str = m.strip()
         if not m_str:
             continue
-        tool_name, args = robust_parse_tool_call(m_str)
+        tool_name, args = robust_parse_tool_call(m_str, enable_correction=enable_correction)
         if tool_name:
             if tool_name not in TRAIN_TOOL_NAMES:
                 print(f"[警告] 模型生成的工具调用 '{tool_name}' 不在训练集范围内，已过滤")
@@ -327,8 +337,9 @@ def parse_tool_calls(text: str):
     for stop in ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]:
         clean_content = clean_content.replace(stop, "").strip()
 
-    # 纯文本内容同步纠错规范化
-    clean_content = sanitize_command_in_text(clean_content)
+    # 纯文本内容同步纠错规范化（仅在开启纠错时执行）
+    if enable_correction:
+        clean_content = sanitize_command_in_text(clean_content)
 
     return clean_content, tool_calls if tool_calls else None
 
@@ -400,7 +411,7 @@ async def chat_completions(req: ChatRequest):
         raise HTTPException(status_code=500, detail="Model not loaded")
 
     tool_count = len(req.tools) if req.tools else 0
-    print(f"\n[收到请求] 消息数: {len(req.messages)}, 工具数: {tool_count}, 流式模式: {req.stream}")
+    print(f"\n[收到请求] 消息数: {len(req.messages)}, 工具数: {tool_count}, 流式模式: {req.stream}, 本地纠错模式: {'开启' if ENABLE_TOOL_CALL_CORRECTION else '关闭(纯模型)'}")
 
     filtered_tools = None
     if req.tools:
@@ -485,7 +496,7 @@ async def chat_completions(req: ChatRequest):
     if "<|im_end|>" in raw_reply:
         raw_reply = raw_reply.split("<|im_end|>")[0]
 
-    clean_content, tool_calls = parse_tool_calls(raw_reply)
+    clean_content, tool_calls = parse_tool_calls(raw_reply, enable_correction=ENABLE_TOOL_CALL_CORRECTION)
 
     if tool_calls:
         print(f"[ToolCalls 解析成功]: {json.dumps(tool_calls, ensure_ascii=False)}")
@@ -655,6 +666,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="GPU", help="Device to run on: GPU, NPU, CPU")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
     args = parser.parse_args()
+
+    print(f"🔧 [本地纠错状态 (config.ENABLE_TOOL_CALL_CORRECTION)]: {'已开启 (ENABLED)' if ENABLE_TOOL_CALL_CORRECTION else '已关闭 (DISABLED - 纯模型原生处理)'}")
 
     load_model(device=args.device)
     uvicorn.run(app, host="127.0.0.1", port=args.port)

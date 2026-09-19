@@ -4,6 +4,7 @@ from typing import Any
 
 # 必须在 import torch 之前设置，启用虚拟内存段扩展，彻底解决显存碎片导致的 OOM
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 if "LOCAL_RANK" not in os.environ:
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -18,8 +19,8 @@ from trl import SFTConfig, SFTTrainer
 from process import process
 from peft import LoraConfig, prepare_model_for_kbit_training
 
-# 单条样本的最大 token 数
-MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "4352"))
+# 单条样本的最大 token 数（实测全量数据最长样本为 3608 token，3648 留足安全余量且大幅削减 4352 带来的巨额 logits 显存）
+MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "3648"))
 
 
 
@@ -196,6 +197,8 @@ def main():
         check_supervision(train_dataset)
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
     device_map = {"": local_rank} if torch.cuda.is_available() else None
 
     bnb_config = BitsAndBytesConfig(
@@ -223,6 +226,14 @@ def main():
         use_gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
     )
+    # 显式激活基座模型的梯度检查点 (Gradient Checkpointing) 并确保输入张量保留梯度计算
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    else:
+        def make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
     sft_config = make_sft_config()
 
@@ -256,6 +267,15 @@ def main():
         data_collator=collator,
         processing_class = tokenizer,
     )
+
+    # 确保在 SFTTrainer 包装 PeftModel 之后，Gradient Checkpointing 与输入梯度钩子仍然稳固生效
+    if hasattr(trainer.model, "gradient_checkpointing_enable"):
+        trainer.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if hasattr(trainer.model, "enable_input_require_grads"):
+        trainer.model.enable_input_require_grads()
+
+    if is_main_process:
+        print("[显存优化] Gradient Checkpointing (梯度检查点) 已成功开启 (use_reentrant=False)")
 
     # 关键修复：peft 会把 adapter 权重对齐成基座的 dtype，而 Qwen3 的 checkpoint 本身是 bf16，
     # 于是 lora_A / lora_B 也变成 bf16 —— 这一点不受 from_pretrained 的 dtype、也不受
